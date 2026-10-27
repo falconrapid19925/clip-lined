@@ -12,12 +12,39 @@ use main::{date_range_strings, parse_hotkey, parse_mode, t};
 #[test]
 fn hotkey_strings_parse_to_mod_bits_and_vkey() {
     // Ctrl=2 Shift=4 Alt=1 Win=8 (bit layout shared with legacy import).
-    assert_eq!(parse_hotkey("Ctrl+Shift+V"), Some((2 | 4, b'V' as u32)), "Ctrl+Shift+V");
-    assert_eq!(parse_hotkey("ctrl+shift+v"), Some((6, b'V' as u32)), "case-insensitive");
-    assert_eq!(parse_hotkey("Alt+F2"), Some((1, 0x71)), "Alt+F2 (VK_F2=0x71)");
+    assert_eq!(
+        parse_hotkey("Ctrl+Shift+V"),
+        Some((2 | 4, b'V' as u32)),
+        "Ctrl+Shift+V"
+    );
+    assert_eq!(
+        parse_hotkey("ctrl+shift+v"),
+        Some((6, b'V' as u32)),
+        "case-insensitive"
+    );
+    assert_eq!(
+        parse_hotkey("Alt+F2"),
+        Some((1, 0x71)),
+        "Alt+F2 (VK_F2=0x71)"
+    );
     assert_eq!(parse_hotkey("Ctrl+0"), Some((2, b'0' as u32)), "digit key");
-    assert_eq!(parse_hotkey("Win+L"), Some((8, b'L' as u32)), "Win alone = 8");
-    assert_eq!(parse_hotkey("F24"), Some((0, 0x87)), "bare function key, no mods");
+    assert_eq!(
+        parse_hotkey("Win+L"),
+        Some((8, b'L' as u32)),
+        "Win alone = 8"
+    );
+    assert_eq!(
+        parse_hotkey("F24"),
+        Some((0, 0x87)),
+        "bare function key, no mods"
+    );
+    assert_eq!(
+        parse_hotkey("Ctrl+Shift+Up"),
+        Some((6, 0x26)),
+        "arrow Up = VK_UP"
+    );
+    assert_eq!(parse_hotkey("ctrl+alt+down"), Some((3, 0x28)), "arrow Down");
+    assert_eq!(parse_hotkey("Ctrl+Space"), Some((2, 0x20)), "space");
 }
 
 #[test]

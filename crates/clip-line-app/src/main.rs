@@ -1,7 +1,6 @@
-//! clipLine desktop app — SPEC.md "ui" section, phase-2 slice.
-//! Single main window; hide-after-paste. No tray/global-hotkey/popup viewport yet
-//! (TODO(spec ui): phase 2 adds the caret-positioned popup viewport, tray-icon and
-//! global-hotkey toggle; v1 interaction = main window + hide after paste is accepted).
+//! clipLine desktop app — SPEC.md "ui" section.
+//! Main window + hide-after-paste + global hotkey toggle + tray (Windows).
+//! TODO(spec ui, phase 2 rest): caret-positioned popup viewport.
 //! TODO(phase 4, Q11): GitHub Releases update check.
 
 use clip_line_core::config::Config;
@@ -31,7 +30,7 @@ pub fn t(s: &str) -> &str {
 
 const DEFAULT_TOML: &str = r#"# clipLine config — see SPEC.md. Regenerated if deleted.
 [hotkeys]
-show = "Ctrl+Shift+V"        # TODO(phase 2): global-hotkey registration
+show = "Ctrl+Shift+Up"      # global show/hide toggle
 
 [paste]
 default_mode = "inject_ctrl_v"   # inject_ctrl_v | set_only | type_in
@@ -55,7 +54,7 @@ struct Hotkeys {
 impl Hotkeys {
     fn with_default_show() -> Self {
         Self {
-            show: "Ctrl+Shift+V".into(),
+            show: "Ctrl+Shift+Up".into(),
         }
     }
 }
@@ -85,10 +84,7 @@ fn load_config(path: &Path) -> anyhow::Result<(Config, Extras)> {
     };
     let hotkeys = toml::from_str::<Hotkeys>(&text).unwrap_or_else(|_| Hotkeys::with_default_show());
     let autostart = toml::from_str::<Autostart>(&text).unwrap_or_default();
-    Ok((
-        toml::from_str(&text)?,
-        Extras { hotkeys, autostart },
-    ))
+    Ok((toml::from_str(&text)?, Extras { hotkeys, autostart }))
 }
 
 /// "Ctrl+Shift+V" → (modifier bits Alt=1|Ctrl=2|Shift=4|Win=8, virtual key).
@@ -123,7 +119,25 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
                         .filter(|n| (1..=24).contains(n))
                         .map(|n| 0x6F + n) // VK_F1 = 0x70
                 } else {
-                    None
+                    // Windows virtual-key codes for non-printable keys users bind.
+                    match k.as_str() {
+                        "UP" => Some(0x26),
+                        "DOWN" => Some(0x28),
+                        "LEFT" => Some(0x25),
+                        "RIGHT" => Some(0x27),
+                        "SPACE" => Some(0x20),
+                        "INSERT" => Some(0x2D),
+                        "DELETE" => Some(0x2E),
+                        "HOME" => Some(0x24),
+                        "END" => Some(0x23),
+                        "PAGEUP" => Some(0x21),
+                        "PAGEDOWN" => Some(0x22),
+                        "ESC" | "ESCAPE" => Some(0x1B),
+                        "TAB" => Some(0x09),
+                        "ENTER" => Some(0x0D),
+                        "BACKSPACE" => Some(0x08),
+                        _ => None,
+                    }
                 };
                 key = Some(v?);
             }
@@ -139,6 +153,26 @@ pub fn parse_mode(s: &str) -> PasteMode {
         "set_only" | "setonly" | "copy" => PasteMode::SetOnly,
         "type_in" | "typein" => PasteMode::TypeIn,
         _ => PasteMode::InjectCtrlV,
+    }
+}
+
+/// Tray label for the current paste mode.
+#[cfg(windows)]
+fn mode_str(m: PasteMode) -> &'static str {
+    match m {
+        PasteMode::SetOnly => "set only",
+        PasteMode::InjectCtrlV => "inject Ctrl+V",
+        PasteMode::TypeIn => "type in",
+    }
+}
+
+/// Tray mode item click cycles the paste mode.
+#[cfg(windows)]
+fn next_mode(m: PasteMode) -> PasteMode {
+    match m {
+        PasteMode::InjectCtrlV => PasteMode::SetOnly,
+        PasteMode::SetOnly => PasteMode::TypeIn,
+        PasteMode::TypeIn => PasteMode::InjectCtrlV,
     }
 }
 
@@ -228,7 +262,7 @@ fn main() -> anyhow::Result<()> {
     let (cfg, extras) = load_config(&cfg_path)?;
     if parse_hotkey(&extras.hotkeys.show).is_none() {
         eprintln!(
-            "config: hotkeys.show {:?} not understood; global hotkeys land in phase 2",
+            "config: hotkeys.show {:?} not understood; global hotkey disabled",
             extras.hotkeys.show
         );
     }
@@ -258,7 +292,26 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "clipLine",
         opts,
-        Box::new(move |_cc| Ok(Box::new(App::new(store, &cfg, suppress)))),
+        Box::new(move |cc| {
+            let mut app = App::new(store, &cfg, suppress);
+            // Both want the main thread (macOS tray rule); eframe's creator runs there.
+            app.register_show_hotkey(&extras.hotkeys.show);
+            // Hotkey/tray events arrive on background threads → poke egui so the
+            // update loop drains the channels immediately, not at the next 1 Hz tick.
+            global_hotkey::GlobalHotKeyEvent::set_event_handler(Some({
+                let ctx = cc.egui_ctx.clone();
+                move |_| ctx.request_repaint()
+            }));
+            #[cfg(windows)]
+            {
+                let ctx = cc.egui_ctx.clone();
+                tray_icon::menu::MenuEvent::set_event_handler(Some(move |_| ctx.request_repaint()));
+                let ctx = cc.egui_ctx.clone();
+                tray_icon::TrayIconEvent::set_event_handler(Some(move |_| ctx.request_repaint()));
+                app.init_tray();
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -267,7 +320,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 fn set_autostart(enabled: bool) -> anyhow::Result<()> {
     use windows::Win32::System::Registry::{
-        RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+        HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
     };
     let subkey: Vec<u16> = r"Software\Microsoft\Windows\CurrentVersion\Run"
         .encode_utf16()
@@ -372,6 +425,8 @@ struct App {
     tab: Tab,
     query: String,
     search_focus: bool,
+    /// Focus+select the search box on next frame (hotkey/tray "show" request).
+    select_after_show: bool,
     starred_only: bool,
     kind_sel: usize,
     date_from: String,
@@ -385,6 +440,14 @@ struct App {
     snip_name: String,
     snip_data: String,
     rename: Option<(i64, String)>,
+    // Global show/hide toggle (SPEC "ui": global-hotkey + tray-icon).
+    gh_manager: Option<global_hotkey::GlobalHotKeyManager>,
+    gh_show: Option<global_hotkey::hotkey::HotKey>,
+    window_visible: bool,
+    #[cfg(windows)]
+    tray: Option<tray_icon::TrayIcon>,
+    #[cfg(windows)]
+    tray_mode_id: tray_icon::menu::MenuId,
 }
 
 impl App {
@@ -397,6 +460,7 @@ impl App {
             tab: Tab::History,
             query: String::new(),
             search_focus: false,
+            select_after_show: false,
             starred_only: false,
             kind_sel: 0,
             date_from: String::new(),
@@ -410,7 +474,156 @@ impl App {
             snip_name: String::new(),
             snip_data: String::new(),
             rename: None,
+            gh_manager: None,
+            gh_show: None,
+            window_visible: true,
+            #[cfg(windows)]
+            tray: None,
+            #[cfg(windows)]
+            tray_mode_id: tray_icon::menu::MenuId::new("clipline-paste-mode"),
         }
+    }
+
+    /// Global show/hide hotkey (spec: failure warns, app continues).
+    /// Registration reuses `parse_hotkey` for validation, then the crate's own
+    /// `FromStr` (same semantics: `Ctrl+Shift+Up`) for the actual binding.
+    fn register_show_hotkey(&mut self, hotkey_str: &str) {
+        if parse_hotkey(hotkey_str).is_none() {
+            return;
+        }
+        let hk: global_hotkey::hotkey::HotKey = match hotkey_str.parse() {
+            Ok(hk) => hk,
+            Err(e) => {
+                eprintln!("hotkey: parse {hotkey_str:?}: {e}");
+                return;
+            }
+        };
+        let manager = match global_hotkey::GlobalHotKeyManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hotkey: manager init failed: {e}");
+                return;
+            }
+        };
+        match manager.register(hk) {
+            Ok(_) => {
+                self.gh_show = Some(hk);
+                self.gh_manager = Some(manager);
+            }
+            Err(e) => eprintln!("hotkey: register {hotkey_str:?} failed: {e}"),
+        }
+    }
+
+    /// Tray (Windows only; other OSes later per SPEC). Programmatically built
+    /// 32x32 solid RGBA icon — no asset file. Menu: Show / paste mode / Quit.
+    #[cfg(windows)]
+    fn init_tray(&mut self) {
+        use tray_icon::menu::{Menu, MenuItem};
+        let rgba = [120u8, 30, 180, 255];
+        let mut px = Vec::with_capacity(32 * 32 * 4);
+        for _ in 0..32 * 32 {
+            px.extend_from_slice(&rgba);
+        }
+        let icon = tray_icon::Icon::from_rgba(px, 32, 32).expect("32x32 RGBA valid");
+
+        let show = MenuItem::with_id("clipline-show", "Show clipLine", true, None);
+        let mode_item = MenuItem::with_id(
+            self.tray_mode_id.clone(),
+            format!("Paste mode: {}", mode_str(self.mode)),
+            true,
+            None,
+        );
+        let quit = MenuItem::with_id("clipline-quit", "Quit", true, None);
+        let menu = Menu::new();
+        let _ = menu.append_items(&[&show, &mode_item, &quit]);
+
+        match tray_icon::TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("clipLine")
+            .with_icon(icon)
+            .build()
+        {
+            Ok(tray) => self.tray = Some(tray),
+            Err(e) => eprintln!("tray: init failed: {e}"),
+        }
+    }
+
+    /// Show/hide toggle shared by hotkey, tray menu and tray click.
+    fn toggle_visible(&mut self, ctx: &Context) {
+        if self.window_visible {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.window_visible = false;
+        } else {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+            self.select_search();
+            self.window_visible = true;
+        }
+    }
+
+    fn show_main(&mut self, ctx: &Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.select_search();
+        self.window_visible = true;
+    }
+
+    /// Drain global hotkey + tray channels (handler fns only request a repaint).
+    fn handle_global_events(&mut self, ctx: &Context) {
+        use global_hotkey::GlobalHotKeyEvent;
+        if let Some(hk) = self.gh_show {
+            while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+                if ev.state == global_hotkey::HotKeyState::Pressed && ev.id() == hk.id() {
+                    self.toggle_visible(ctx);
+                }
+            }
+        }
+        #[cfg(windows)]
+        if self.tray.is_some() {
+            use tray_icon::menu::MenuEvent;
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                match ev.id().as_ref() {
+                    "clipline-show" => self.show_main(ctx),
+                    "clipline-paste-mode" => {
+                        self.mode = next_mode(self.mode);
+                        if let Some(tray) = &self.tray {
+                            tray.set_menu(Some(Box::new(Self::tray_menu(self.mode))));
+                        }
+                    }
+                    "clipline-quit" => ctx.send_viewport_cmd(ViewportCommand::Close),
+                    _ => {}
+                }
+            }
+            while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
+                if let tray_icon::TrayIconEvent::Click { button, .. } = ev {
+                    if button == tray_icon::MouseButton::Left {
+                        self.toggle_visible(ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn tray_menu(mode: PasteMode) -> tray_icon::menu::Menu {
+        use tray_icon::menu::{Menu, MenuId, MenuItem};
+        let show = MenuItem::with_id("clipline-show", "Show clipLine", true, None);
+        let mode_item = MenuItem::with_id(
+            MenuId::new("clipline-paste-mode"),
+            format!("Paste mode: {}", mode_str(mode)),
+            true,
+            None,
+        );
+        let quit = MenuItem::with_id("clipline-quit", "Quit", true, None);
+        let menu = Menu::new();
+        let _ = menu.append_items(&[&show, &mode_item, &quit]);
+        menu
+    }
+
+    /// Select the search field: focus it and select its text (hotkey show).
+    fn select_search(&mut self) {
+        self.search_focus = false;
+        self.select_after_show = true;
     }
 
     fn refresh_if_needed(&mut self) {
@@ -525,7 +738,9 @@ impl App {
         #[cfg(not(windows))]
         {
             let _ = (mode, blocks);
-            Err(anyhow::anyhow!("paste adapter not built on this OS (phase 3)"))
+            Err(anyhow::anyhow!(
+                "paste adapter not built on this OS (phase 3)"
+            ))
         }
     }
 
@@ -591,11 +806,7 @@ impl App {
                             ui.close();
                         }
                         if ui
-                            .button(if r.starred {
-                                t("Unstar")
-                            } else {
-                                t("Star")
-                            })
+                            .button(if r.starred { t("Unstar") } else { t("Star") })
                             .clicked()
                         {
                             let _ = self.store.set_star(r.id, !r.starred);
@@ -617,9 +828,7 @@ impl App {
             ui.label(t("Name"));
             ui.text_edit_singleline(&mut self.snip_name);
             ui.label(t("Text"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.snip_data).desired_width(f32::INFINITY),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.snip_data).desired_width(f32::INFINITY));
             if ui.button(t("Add snippet")).clicked() && !self.snip_name.trim().is_empty() {
                 match self
                     .store
@@ -645,7 +854,9 @@ impl App {
             .body(|body| {
                 body.rows(22.0, n, |mut row| {
                     let idx = row.index();
-                    let Some(s0) = self.snips.get(idx) else { return };
+                    let Some(s0) = self.snips.get(idx) else {
+                        return;
+                    };
                     let s = s0.clone();
                     row.col(|ui| {
                         if self.rename.as_ref().is_some_and(|(id, _)| *id == s.id) {
@@ -701,6 +912,7 @@ impl eframe::App for App {
     /// Runs even while the window is hidden (0.37 trait) — keeps history fresh.
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.refresh_if_needed();
+        self.handle_global_events(ctx);
         self.handle_keys(ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
     }
@@ -721,6 +933,12 @@ impl eframe::App for App {
                             .hint_text(t("Search"))
                             .desired_width(220.0),
                     );
+                    if self.select_after_show {
+                        // ponytail: select-all, not just focus — needs a cursor-state
+                        // edit via egui::text_edit; plain focus is enough for v1.
+                        r.request_focus();
+                        self.select_after_show = false;
+                    }
                     self.search_focus = r.has_focus();
                     if r.changed() {
                         self.dirty = true;
