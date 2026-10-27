@@ -610,7 +610,10 @@ dependencies = [
  "clip-line-win",
  "eframe",
  "egui_extras",
+ "serde",
  "tempfile",
+ "toml",
+ "windows",
 ]
 
 [[package]]
