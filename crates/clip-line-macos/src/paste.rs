@@ -103,8 +103,8 @@ pub fn block_to_ns_type(b: &Block) -> Option<(String, Vec<u8>)> {
             ))
         }
         Format::Registered(_, name) => match name.as_str() {
-            "PNG" => Some(("public.png".into(), b.bytes.clone())),
-            "TIFF" => Some(("public.tiff".into(), b.bytes.clone())),
+            "PNG" | "image/png" | "public.png" => Some(("public.png".into(), b.bytes.clone())),
+            "TIFF" | "image/tiff" | "public.tiff" => Some(("public.tiff".into(), b.bytes.clone())),
             other => Some((other.to_string(), b.bytes.clone())),
         },
     }

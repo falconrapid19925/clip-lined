@@ -91,10 +91,12 @@ fn date_range_builds_sqlite_bounds() {
     let (f, t) = date_range_strings("", " 2026-1-1 ");
     assert_eq!(f, None, "empty from");
     assert_eq!(t, None, "malformed to ignored");
-    // Shape-only validation: digits+dashes pass (SQLite string compare decides the rest).
+    // Invalid calendar dates must not accidentally widen destructive ranges.
     let (f, t) = date_range_strings("2026-13-40", "not-a-date!");
-    assert_eq!(f.as_deref(), Some("2026-13-40 00:00:00"));
+    assert_eq!(f, None);
     assert_eq!(t, None);
+    assert!(date_range_strings("2024-02-29", "2026-02-29").0.is_some());
+    assert!(date_range_strings("2024-02-29", "2026-02-29").1.is_none());
 }
 
 #[test]

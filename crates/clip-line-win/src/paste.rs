@@ -4,7 +4,8 @@ use clip_line_core::capture::{Block, Format};
 use clip_line_core::paste::{ClipData, PasteMode, Paster};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -92,7 +93,27 @@ unsafe fn set_block(b: &Block) -> anyhow::Result<()> {
             Format::ImageDib => (8, b.bytes.clone()),
             Format::ImageDibV5 => (17, b.bytes.clone()),
             Format::FileDrop => (15, build_hdrop(&file_list(b)?)),
-            Format::Registered(id, _) => (*id, b.bytes.clone()),
+            Format::Registered(id, name) => {
+                let fmt = if name.is_empty() {
+                    if !(0xC000..=0xFFFF).contains(id) {
+                        anyhow::bail!("registered clipboard format name is missing");
+                    }
+                    *id
+                } else {
+                    let name = match name.as_str() {
+                        "image/png" | "public.png" => "PNG",
+                        "image/tiff" | "public.tiff" => "TIFF",
+                        _ => name,
+                    };
+                    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                    let registered = RegisterClipboardFormatW(windows::core::PCWSTR(wide.as_ptr()));
+                    if registered == 0 {
+                        anyhow::bail!("cannot register clipboard format {name}");
+                    }
+                    registered
+                };
+                (fmt, b.bytes.clone())
+            }
         };
         let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
         let p = GlobalLock(h);

@@ -1,0 +1,36 @@
+name: Windows preview
+
+on:
+  push:
+    branches: [preview/windows-parity]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  preview:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Windows preview
+        run: cargo build --release -p clip-line-app --features encryption
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pkg | Out-Null
+          Copy-Item target/release/clip-line-app.exe pkg/
+          Copy-Item target/release/clip-line-headless.exe pkg/
+          Compress-Archive -Path pkg -DestinationPath clip-line-windows-preview.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clip-line-windows-preview
+          path: clip-line-windows-preview.zip
+      - name: Publish prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.2.0-preview-$($env:GITHUB_SHA.Substring(0, 12))"
+          gh release create $tag clip-line-windows-preview.zip --target $env:GITHUB_SHA --prerelease --title "Windows preview $tag" --notes "Preview for testing Windows tray, popup, and clipboard behavior. Back up existing databases before use."
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

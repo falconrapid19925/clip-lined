@@ -105,3 +105,31 @@ fn legacy_ini_missing_keys_defaults_empty() {
     let hs = import_legacy_ini(&p).unwrap();
     assert!(hs.is_empty());
 }
+
+#[test]
+fn capture_rules_exclude_matching_events() {
+    use clip_line_core::capture::{Block, ClipEvent, Format};
+    use clip_line_core::config::Config;
+    let cfg: Config = toml::from_str("[capture]\nexcluded_apps = ['KeePass.exe']\nexcluded_formats = ['CF_HDROP']\nmax_clip_mb = 1\n").unwrap();
+    let event = |app: &str, format, size| ClipEvent {
+        source_app: app.into(),
+        source_title: String::new(),
+        blocks: vec![Block {
+            format,
+            bytes: vec![0; size],
+        }],
+    };
+    assert!(
+        cfg.capture
+            .excludes(&event("keepass.EXE", Format::UnicodeText, 1))
+    );
+    assert!(cfg.capture.excludes(&event("other", Format::FileDrop, 1)));
+    assert!(
+        cfg.capture
+            .excludes(&event("other", Format::UnicodeText, 1024 * 1024 + 1))
+    );
+    assert!(
+        !cfg.capture
+            .excludes(&event("other", Format::UnicodeText, 1))
+    );
+}

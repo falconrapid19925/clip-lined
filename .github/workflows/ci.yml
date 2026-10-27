@@ -56,7 +56,7 @@ jobs:
           - os: ubuntu-latest
             artifact: clip-line-linux-x64
           - os: macos-latest
-            artifact: clip-line-macos-universal
+            artifact: clip-line-macos-arm64
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/cache@v6.1.0
@@ -66,8 +66,15 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-rel-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml') }}
-      - name: Build release
-        run: cargo build --release -p clip-line-app
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libxrandr-dev
+      - name: Build Linux release
+        if: runner.os == 'Linux'
+        run: cargo build --release -p clip-line-app --features x11,wayland,encryption
+      - name: Build Windows and macOS release
+        if: runner.os != 'Linux'
+        run: cargo build --release -p clip-line-app --features encryption
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.artifact }}

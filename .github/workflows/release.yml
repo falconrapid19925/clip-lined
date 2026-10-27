@@ -23,7 +23,7 @@ jobs:
             asset: clip-line-linux-x64.tar.gz
           - os: macos-latest
             exe: clip-line-app
-            asset: clip-line-macos-universal.tar.gz
+            asset: clip-line-macos-arm64.tar.gz
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/cache@v6.1.0
@@ -33,7 +33,15 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-rel-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml') }}
-      - run: cargo build --release -p clip-line-app
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libxrandr-dev
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: cargo build --release -p clip-line-app --features x11,wayland,encryption
+      - name: Build Windows and macOS
+        if: runner.os != 'Linux'
+        run: cargo build --release -p clip-line-app --features encryption
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
@@ -47,7 +55,7 @@ jobs:
           mkdir pkg
           cp target/release/clip-line-app.exe pkg/
           cp target/release/clip-line-headless.exe pkg/
-          Compress-Archive -Path pkg/* -DestinationPath "${{ matrix.asset }}"
+          Compress-Archive -Path pkg -DestinationPath "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.asset }}

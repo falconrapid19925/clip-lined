@@ -1,8 +1,7 @@
 //! clipLine desktop app — SPEC.md "ui" section.
 //! Main window + hide-after-paste + global hotkey toggle + tray (Windows).
-//! TODO(spec ui, phase 2 rest): caret-positioned popup viewport.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use clip_line_core::config::Config;
 use clip_line_core::paste::{ClipData, PasteMode};
@@ -14,6 +13,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(not(windows))]
+mod autostart;
 
 /// Self-paste suppression slot: the UI thread stores the payload it is about to
 /// write to the clipboard BEFORE writing; the capture thread skips the event
@@ -40,6 +42,16 @@ default_mode = "inject_ctrl_v"   # inject_ctrl_v | set_only | type_in
 [ui]
 hide_after_ms = 1200
 
+[privacy]
+clear_on_exit = false
+secure_delete = false
+
+[capture]
+excluded_apps = []
+excluded_formats = [] # e.g. CF_UNICODETEXT or a registered format name
+# max_clip_mb = 20
+# max_image_mb = 10
+
 [autostart]
 enabled = false
 
@@ -50,7 +62,7 @@ check_on_start = true    # Q11: GitHub Releases check on start; no telemetry
 # path = "C:\path\to\clipline.db"
 "#;
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(default)]
 struct Hotkeys {
     show: String,
@@ -61,6 +73,12 @@ impl Hotkeys {
         Self {
             show: "Ctrl+Shift+Up".into(),
         }
+    }
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Self::with_default_show()
     }
 }
 
@@ -87,7 +105,8 @@ impl Default for UpdateCfg {
 
 /// App-level config sections on top of `clip_line_core::config::Config`
 /// (storage/paste/ui). Parsed from the same TOML text; core ignores unknown keys.
-#[derive(Debug)]
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
 struct Extras {
     hotkeys: Hotkeys,
     autostart: Autostart,
@@ -103,17 +122,27 @@ fn load_config(path: &Path) -> anyhow::Result<(Config, Extras)> {
         }
         Err(e) => return Err(e.into()),
     };
-    let hotkeys = toml::from_str::<Hotkeys>(&text).unwrap_or_else(|_| Hotkeys::with_default_show());
-    let autostart = toml::from_str::<Autostart>(&text).unwrap_or_default();
-    let update = toml::from_str::<UpdateCfg>(&text).unwrap_or_default();
-    Ok((
-        toml::from_str(&text)?,
-        Extras {
-            hotkeys,
-            autostart,
-            update,
-        },
-    ))
+    Ok((toml::from_str(&text)?, toml::from_str(&text)?))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn app_sections_and_defaults_are_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[hotkeys]\nshow = 'Alt+F2'\n[autostart]\nenabled = true\n[update]\ncheck_on_start = false\n").unwrap();
+        let (_, extras) = load_config(&path).unwrap();
+        assert_eq!(extras.hotkeys.show, "Alt+F2");
+        assert!(extras.autostart.enabled);
+        assert!(!extras.update.check_on_start);
+        std::fs::write(&path, "[hotkeys]\n").unwrap();
+        let (_, extras) = load_config(&path).unwrap();
+        assert_eq!(extras.hotkeys.show, "Ctrl+Shift+Up");
+        assert!(extras.update.check_on_start);
+    }
 }
 
 /// "Ctrl+Shift+V" → (modifier bits Alt=1|Ctrl=2|Shift=4|Win=8, virtual key).
@@ -216,7 +245,21 @@ pub fn date_range_strings(from: &str, to: &str) -> (Option<String>, Option<Strin
             && s[..4].bytes().all(|b| b.is_ascii_digit())
             && s[5..7].bytes().all(|b| b.is_ascii_digit())
             && s[8..].bytes().all(|b| b.is_ascii_digit());
-        ok.then(|| format!("{s}{suffix}"))
+        if !ok {
+            return None;
+        }
+        let year: u32 = s[..4].parse().ok()?;
+        let month: u32 = s[5..7].parse().ok()?;
+        let day: u32 = s[8..].parse().ok()?;
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return None,
+        };
+        (year > 0 && day > 0 && day <= days).then(|| format!("{s}{suffix}"))
     };
     (one(from, " 00:00:00"), one(to, " 23:59:59"))
 }
@@ -276,7 +319,7 @@ fn single_instance_guard() -> anyhow::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        use std::io::OpenOptions;
+        use std::fs::OpenOptions;
         let lock = config_dir()
             .ok_or_else(|| anyhow::anyhow!("no config dir"))?
             .join("clipline.lock");
@@ -324,10 +367,26 @@ fn set_toml_show_hotkey(text: &str, hotkey: &str) -> anyhow::Result<String> {
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut import_ini = None;
+    let mut import_db = None;
     while let Some(a) = args.next() {
-        if a == "--import-ini" {
-            import_ini = args.next().map(PathBuf::from);
+        match a.as_str() {
+            "--import-ini" => {
+                import_ini =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--import-ini requires a path")
+                    })?))
+            }
+            "--import-db" => {
+                import_db =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("--import-db requires a path")
+                    })?))
+            }
+            _ => anyhow::bail!("unknown argument: {a}"),
         }
+    }
+    if import_ini.is_some() && import_db.is_some() {
+        anyhow::bail!("Use --import-ini and --import-db separately");
     }
     if let Some(ini) = import_ini {
         let hks = clip_line_core::config::import_legacy_ini(&ini)?;
@@ -387,7 +446,26 @@ fn main() -> anyhow::Result<()> {
     }
 
     let db = db_path(cfg.storage.path.as_deref())?;
-    let store = Arc::new(Store::open(&db, StoreOpts::default())?);
+    // The passphrase is supplied separately from the config file.
+    let key = std::env::var("CLIP_LINE_DB_KEY").ok();
+    let store = Arc::new(Store::open(&db, StoreOpts { key })?);
+    if let Some(source) = import_db {
+        if !source.is_file() {
+            anyhow::bail!("import source is not a file: {}", source.display());
+        }
+        if source.canonicalize()? == db.canonicalize()? {
+            anyhow::bail!("import source and destination are the same database");
+        }
+        let count = store.import_legacy(&source)?;
+        println!(
+            "Imported {count} history rows into {} (existing IDs were retained)",
+            db.display()
+        );
+        return Ok(());
+    }
+    if cfg.privacy.secure_delete {
+        store.set_secure_delete(true)?;
+    }
     if let Err(e) = store.attach_snippets(&db.with_file_name("snippets.sdb")) {
         eprintln!("snippets disabled: {e}");
     }
@@ -396,12 +474,19 @@ fn main() -> anyhow::Result<()> {
     if let Err(e) = set_autostart(extras.autostart.enabled) {
         eprintln!("autostart: {e}");
     }
-    // TODO(spec Q15): macOS Login Items / XDG autostart .desktop land with the
-    // phase-3 non-Windows adapters.
+    #[cfg(not(windows))]
+    if let Err(e) = autostart::set_autostart(extras.autostart.enabled) {
+        eprintln!("autostart: {e}");
+    }
 
     let suppress: SuppressSlot = Arc::new(Mutex::new(None));
     let (capture_tx, capture_rx) = std::sync::mpsc::channel::<String>();
-    spawn_capture(store.clone(), suppress.clone(), capture_tx)?;
+    spawn_capture(
+        store.clone(),
+        suppress.clone(),
+        capture_tx,
+        cfg.capture.clone(),
+    )?;
     // Capture-disabled messages land in the footer once; drained in logic().
     // Shared with the update-check channel pattern (Q11).
     CAPTURE_RX.set(Mutex::new(capture_rx)).ok();
@@ -481,6 +566,7 @@ fn spawn_capture(
     store: Arc<Store>,
     suppress: SuppressSlot,
     status_tx: std::sync::mpsc::Sender<String>,
+    rules: clip_line_core::config::CaptureRules,
 ) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("capture".into())
@@ -492,7 +578,7 @@ fn spawn_capture(
                     return;
                 }
             };
-            capture_loop(&mut cap, store, suppress, status_tx);
+            capture_loop(&mut cap, store, suppress, status_tx, rules);
         })
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("spawn capture: {e}"))?;
@@ -504,6 +590,7 @@ fn spawn_capture(
     store: Arc<Store>,
     suppress: SuppressSlot,
     status_tx: std::sync::mpsc::Sender<String>,
+    rules: clip_line_core::config::CaptureRules,
 ) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("capture".into())
@@ -516,7 +603,7 @@ fn spawn_capture(
                     return;
                 }
             };
-            capture_loop(&mut cap, store, suppress, status_tx);
+            capture_loop(&mut cap, store, suppress, status_tx, rules);
         })
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("spawn capture: {e}"))
@@ -528,32 +615,32 @@ fn spawn_capture(
     store: Arc<Store>,
     suppress: SuppressSlot,
     status_tx: std::sync::mpsc::Sender<String>,
+    rules: clip_line_core::config::CaptureRules,
 ) -> anyhow::Result<()> {
-    use clip_line_core::capture::Capture;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
             if std::env::var_os("WAYLAND_DISPLAY").is_some() {
                 #[cfg(feature = "wayland")]
                 match clip_line_wayland::WaylandCapture::new() {
-                    Ok(mut c) => capture_loop(&mut c, store, suppress, status_tx),
+                    Ok(mut c) => capture_loop(&mut c, store, suppress, status_tx, rules),
                     Err(e) => {
                         // story 7: say why, not silence
                         let _ = status_tx.send(format!("capture disabled: {e}"));
                     }
                 }
                 #[cfg(not(feature = "wayland"))]
-                let _ = (store, suppress, status_tx); // build lacks wayland support
+                let _ = (store, suppress, status_tx, rules); // build lacks wayland support
             } else {
                 #[cfg(feature = "x11")]
                 match clip_line_x11::X11Capture::new() {
-                    Ok(mut c) => capture_loop(&mut c, store, suppress, status_tx),
+                    Ok(mut c) => capture_loop(&mut c, store, suppress, status_tx, rules),
                     Err(e) => {
                         let _ = status_tx.send(format!("capture disabled: {e}"));
                     }
                 }
                 #[cfg(not(feature = "x11"))]
-                let _ = (store, suppress, status_tx); // build lacks x11 support
+                let _ = (store, suppress, status_tx, rules); // build lacks x11 support
             }
         })
         .map(|_| ())
@@ -574,22 +661,34 @@ fn paste_on_this_os(data: &ClipData, mode: PasteMode) -> anyhow::Result<()> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn paste_on_this_os(data: &ClipData, mode: PasteMode) -> anyhow::Result<()> {
-    use clip_line_core::paste::Paster;
+    let _ = (data, mode); // Parameters may be unused in builds without adapters.
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        clip_line_wayland::WaylandPaster.paste(data, mode)
+        #[cfg(feature = "wayland")]
+        {
+            use clip_line_core::paste::Paster;
+            clip_line_wayland::WaylandPaster.paste(data, mode)
+        }
+        #[cfg(not(feature = "wayland"))]
+        anyhow::bail!("This build does not include Wayland paste support")
     } else {
-        // X11Paster owns the selection; cheap to build per paste.
-        use clip_line_core::paste::Paster;
-        clip_line_x11::X11Paster::new()?.paste(data, mode)
+        #[cfg(feature = "x11")]
+        {
+            use clip_line_core::paste::Paster;
+            clip_line_x11::X11Paster::new()?.paste(data, mode)
+        }
+        #[cfg(not(feature = "x11"))]
+        anyhow::bail!("This build does not include X11 paste support")
     }
 }
 
 /// Shared drain loop: skip self-writes, persist foreign events, report fatal loss.
+#[cfg(any(windows, target_os = "macos", feature = "x11", feature = "wayland"))]
 fn capture_loop<C: clip_line_core::capture::Capture>(
     cap: &mut C,
     store: Arc<Store>,
     suppress: SuppressSlot,
     status_tx: std::sync::mpsc::Sender<String>,
+    rules: clip_line_core::config::CaptureRules,
 ) {
     loop {
         match cap.next_event() {
@@ -609,6 +708,9 @@ fn capture_loop<C: clip_line_core::capture::Capture>(
                         }
                     });
                 if mine.is_some() {
+                    continue;
+                }
+                if rules.excludes(&ev) {
                     continue;
                 }
                 if let Err(e) = store.append(&ev) {
@@ -631,6 +733,7 @@ enum Tab {
 
 struct App {
     store: Arc<Store>,
+    clear_on_exit: bool,
     suppress: SuppressSlot,
     mode: PasteMode,
     hide_after_ms: u64,
@@ -645,6 +748,11 @@ struct App {
     kind_sel: usize,
     date_from: String,
     date_to: String,
+    tag_edit: Option<(i64, String)>,
+    labels_open: bool,
+    labels: Vec<String>,
+    label_rename: Option<(String, String)>,
+    delete_confirmation: Option<bool>, // true = all, false = date range
     rows: Vec<ClipRow>,
     selected: Option<usize>,
     dirty: bool,
@@ -657,7 +765,13 @@ struct App {
     // Global show/hide toggle (SPEC "ui": global-hotkey + tray-icon).
     gh_manager: Option<global_hotkey::GlobalHotKeyManager>,
     gh_show: Option<global_hotkey::hotkey::HotKey>,
-    window_visible: bool,
+    window_visible: Arc<AtomicBool>,
+    popup: bool,
+    main_position: Option<egui::Pos2>,
+    #[cfg(windows)]
+    paste_target: isize,
+    #[cfg(not(windows))]
+    paste_target: Option<u32>,
     #[cfg(windows)]
     tray: Option<tray_icon::TrayIcon>,
     #[cfg(windows)]
@@ -671,6 +785,7 @@ impl App {
     fn new(store: Arc<Store>, cfg: &Config, suppress: SuppressSlot) -> Self {
         let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
         App {
+            clear_on_exit: cfg.privacy.clear_on_exit,
             mode: parse_mode(&cfg.paste.default_mode),
             hide_after_ms: cfg.ui.hide_after_ms,
             show_gen: Arc::new(AtomicU64::new(0)),
@@ -684,6 +799,11 @@ impl App {
             kind_sel: 0,
             date_from: String::new(),
             date_to: String::new(),
+            tag_edit: None,
+            labels_open: false,
+            labels: Vec::new(),
+            label_rename: None,
+            delete_confirmation: None,
             rows: Vec::new(),
             selected: None,
             dirty: true,
@@ -695,7 +815,13 @@ impl App {
             rename: None,
             gh_manager: None,
             gh_show: None,
-            window_visible: true,
+            window_visible: Arc::new(AtomicBool::new(true)),
+            popup: false,
+            main_position: None,
+            #[cfg(windows)]
+            paste_target: 0,
+            #[cfg(not(windows))]
+            paste_target: None,
             #[cfg(windows)]
             tray: None,
             #[cfg(windows)]
@@ -797,6 +923,7 @@ impl App {
 
         match tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
             .with_tooltip("clipLine")
             .with_icon(icon)
             .build()
@@ -806,24 +933,51 @@ impl App {
         }
     }
 
-    /// Show/hide toggle shared by hotkey, tray menu and tray click.
-    fn toggle_visible(&mut self, ctx: &Context) {
-        if self.window_visible {
+    /// The hotkey switches to an always-on-top view at the caret.
+    fn toggle_popup(&mut self, ctx: &Context) {
+        if self.window_visible.load(Ordering::SeqCst) && self.popup {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.window_visible = false;
+            self.window_visible.store(false, Ordering::SeqCst);
         } else {
+            if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+                self.capture_paste_target();
+            }
+            if !self.popup {
+                self.main_position = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
+            }
+            self.popup = true;
+            ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
+                egui::viewport::WindowLevel::AlwaysOnTop,
+            ));
+            #[cfg(windows)]
+            if let Some(pos) = caret_screen_position(ctx) {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+            }
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
             self.select_search();
-            self.window_visible = true;
+            self.window_visible.store(true, Ordering::SeqCst);
         }
     }
 
+    #[cfg(windows)]
     fn show_main(&mut self, ctx: &Context) {
+        self.capture_paste_target();
+        if self.popup {
+            ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
+                egui::viewport::WindowLevel::Normal,
+            ));
+            if let Some(pos) = self.main_position.take() {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+            }
+            self.popup = false;
+        }
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.select_search();
-        self.window_visible = true;
+        self.window_visible.store(true, Ordering::SeqCst);
     }
 
     /// Drain global hotkey + tray channels (handler fns only request a repaint).
@@ -832,7 +986,7 @@ impl App {
         if let Some(hk) = self.gh_show {
             while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
                 if ev.state == global_hotkey::HotKeyState::Pressed && ev.id() == hk.id() {
-                    self.toggle_visible(ctx);
+                    self.toggle_popup(ctx);
                 }
             }
         }
@@ -853,9 +1007,21 @@ impl App {
                 }
             }
             while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
-                if let tray_icon::TrayIconEvent::Click { button, .. } = ev {
-                    if button == tray_icon::MouseButton::Left {
-                        self.toggle_visible(ctx);
+                if let tray_icon::TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } = ev
+                {
+                    if button == tray_icon::MouseButton::Left
+                        && button_state == tray_icon::MouseButtonState::Up
+                    {
+                        if self.window_visible.load(Ordering::SeqCst) && !self.popup {
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                            self.window_visible.store(false, Ordering::SeqCst);
+                        } else {
+                            self.show_main(ctx);
+                        }
                     }
                 }
             }
@@ -903,7 +1069,7 @@ impl App {
                 },
                 from,
                 to,
-                limit: 500,
+                limit: 10_000,
                 ..Default::default()
             };
             match self.store.list(&f) {
@@ -990,8 +1156,8 @@ impl App {
             self.paste_selected(ctx);
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            // TODO(spec ui): Esc closes the hotkey popup in phase 2; v1 hides the window.
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.window_visible.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1013,6 +1179,7 @@ impl App {
                         self.hide_after_ms,
                         self.show_gen.clone(),
                         self.show_gen.load(Ordering::SeqCst),
+                        self.window_visible.clone(),
                     );
                 }
             }
@@ -1033,6 +1200,9 @@ impl App {
                 anyhow::bail!("no text block in this clip");
             }
         }
+        if mode != PasteMode::SetOnly {
+            self.restore_paste_target()?;
+        }
         // Arm suppression BEFORE the clipboard write — see SuppressSlot.
         // Disarm on failure so a stale slot cannot swallow the next foreign copy.
         let payload = clip_line_core::envelope::pack(&blocks)?;
@@ -1042,6 +1212,81 @@ impl App {
             *self.suppress.lock().unwrap() = None;
         }
         r
+    }
+
+    /// Save the foreground application before clipLine takes focus.
+    #[cfg(windows)]
+    fn capture_paste_target(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if !hwnd.0.is_null() && pid != 0 && pid != std::process::id() {
+                self.paste_target = hwnd.0 as isize;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_paste_target(&mut self) {
+        self.paste_target = clip_line_macos::focused_application().map(|pid| pid as u32);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn capture_paste_target(&mut self) {
+        self.paste_target = None;
+        #[cfg(feature = "x11")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            self.paste_target = clip_line_x11::focused_window().ok();
+        }
+    }
+
+    /// Refuse injection if the original target can no longer be focused.
+    #[cfg(windows)]
+    fn restore_paste_target(&self) -> anyhow::Result<()> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsWindow, SetForegroundWindow,
+        };
+        let hwnd = HWND(self.paste_target as *mut _);
+        unsafe {
+            if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+                anyhow::bail!(
+                    "No target window; open clipLine with its hotkey from the app you want to paste into"
+                );
+            }
+            if !SetForegroundWindow(hwnd).as_bool() || GetForegroundWindow() != hwnd {
+                anyhow::bail!(
+                    "Could not focus the target window; use Copy only and paste manually"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn restore_paste_target(&self) -> anyhow::Result<()> {
+        let pid = self.paste_target.ok_or_else(|| {
+            anyhow::anyhow!("No target application; use Copy only and paste manually")
+        })?;
+        clip_line_macos::focus_application(pid as i32)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn restore_paste_target(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "x11")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            let target = self.paste_target.ok_or_else(|| {
+                anyhow::anyhow!("No target window; use Copy only and paste manually")
+            })?;
+            return clip_line_x11::focus_window(target);
+        }
+        anyhow::bail!(
+            "Automatic focus restoration is unavailable; use Copy only and paste manually"
+        )
     }
 
     fn history_ui(&mut self, ui: &mut egui::Ui) {
@@ -1110,6 +1355,10 @@ impl App {
                             self.paste_row(ui.ctx(), r.id, PasteMode::SetOnly, false);
                             ui.close();
                         }
+                        if ui.button("Edit tags").clicked() {
+                            self.tag_edit = Some((r.id, r.tags.trim_matches(',').to_owned()));
+                            ui.close();
+                        }
                         if ui.button(t("Type in")).clicked() {
                             self.paste_row(ui.ctx(), r.id, PasteMode::TypeIn, false);
                             ui.close();
@@ -1130,6 +1379,119 @@ impl App {
                     });
                 });
             });
+    }
+
+    fn history_dialogs(&mut self, ctx: &Context) {
+        if let Some((id, mut text)) = self.tag_edit.take() {
+            let mut open = true;
+            let mut save = false;
+            egui::Window::new("Edit tags")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("Separate tags with commas");
+                    ui.text_edit_singleline(&mut text);
+                    save = ui.button("Save").clicked();
+                });
+            if save {
+                let mut tags: Vec<String> = Vec::new();
+                for tag in text.split(',').map(str::trim).filter(|tag| !tag.is_empty()) {
+                    if !tags.iter().any(|existing| existing == tag) {
+                        tags.push(tag.to_owned());
+                    }
+                }
+                if let Err(e) = self.store.set_tags(id, &tags) {
+                    self.status = format!("tags: {e}");
+                }
+                self.dirty = true;
+            } else if open {
+                self.tag_edit = Some((id, text));
+            }
+        }
+        if self.labels_open {
+            let mut open = true;
+            egui::Window::new("Labels").open(&mut open).show(ctx, |ui| {
+                if self.labels.is_empty() {
+                    ui.label("No labels yet. Edit tags on a clip to add one.");
+                }
+                for label in self.labels.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(&label);
+                        if ui.button("Rename").clicked() {
+                            self.label_rename = Some((label.clone(), label.clone()));
+                        }
+                        if ui.button("Remove").clicked() {
+                            if let Err(e) = self.store.change_label(&label, None) {
+                                self.status = format!("remove label: {e}");
+                            }
+                            self.refresh_labels();
+                            self.dirty = true;
+                        }
+                    });
+                }
+            });
+            self.labels_open = open;
+        }
+        if let Some((old, mut new)) = self.label_rename.take() {
+            let mut open = true;
+            let mut save = false;
+            egui::Window::new("Rename label")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.text_edit_singleline(&mut new);
+                    save = ui.button("Save").clicked();
+                });
+            if save {
+                if let Err(e) = self.store.change_label(&old, Some(new.trim())) {
+                    self.status = format!("rename label: {e}");
+                }
+                self.refresh_labels();
+                self.dirty = true;
+            } else if open {
+                self.label_rename = Some((old, new));
+            }
+        }
+        if let Some(all) = self.delete_confirmation {
+            let mut open = true;
+            let mut confirm = false;
+            egui::Window::new("Confirm deletion")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if all {
+                        ui.label("Delete all clipboard history?");
+                    } else {
+                        ui.label(format!(
+                            "Delete history from {} through {}?",
+                            self.date_from, self.date_to
+                        ));
+                    }
+                    confirm = ui.button("Delete history").clicked();
+                });
+            if confirm {
+                let result = if all {
+                    self.store.delete_all()
+                } else {
+                    let (from, to) = date_range_strings(&self.date_from, &self.date_to);
+                    match (from, to) {
+                        (Some(from), Some(to)) if from <= to => self.store.delete_range(&from, &to),
+                        _ => Err(anyhow::anyhow!("Enter a valid start and end date in order")),
+                    }
+                };
+                if let Err(e) = result {
+                    self.status = format!("delete: {e}");
+                }
+                self.dirty = true;
+                self.delete_confirmation = None;
+            } else if !open {
+                self.delete_confirmation = None;
+            }
+        }
+    }
+
+    fn refresh_labels(&mut self) {
+        match self.store.labels() {
+            Ok(labels) => self.labels = labels,
+            Err(e) => self.status = format!("labels: {e}"),
+        }
     }
 
     fn snippets_ui(&mut self, ui: &mut egui::Ui) {
@@ -1158,6 +1520,7 @@ impl App {
             .striped(true)
             .column(Column::exact(180.0))
             .column(Column::remainder())
+            .column(Column::exact(64.0))
             .column(Column::exact(80.0))
             .column(Column::exact(80.0))
             .body(|body| {
@@ -1188,6 +1551,11 @@ impl App {
                         ui.label(&s.data);
                     });
                     row.col(|ui| {
+                        if ui.button("Paste").clicked() {
+                            self.paste_snippet(ui.ctx(), &s.data);
+                        }
+                    });
+                    row.col(|ui| {
                         if ui.button(t("Rename")).clicked() {
                             self.rename = Some((s.id, s.name.clone()));
                         }
@@ -1203,11 +1571,106 @@ impl App {
                 });
             });
     }
+
+    fn paste_snippet(&mut self, ctx: &Context, text: &str) {
+        let result = (|| -> anyhow::Result<()> {
+            if self.mode != PasteMode::SetOnly {
+                self.restore_paste_target()?;
+            }
+            let bytes = text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let blocks = vec![clip_line_core::capture::Block {
+                format: clip_line_core::Format::UnicodeText,
+                bytes,
+            }];
+            *self.suppress.lock().unwrap() = Some(clip_line_core::envelope::pack(&blocks)?);
+            paste_on_this_os(&ClipData { blocks }, self.mode)
+        })();
+        match result {
+            Ok(()) if self.mode != PasteMode::SetOnly => hide_soon(
+                ctx.clone(),
+                self.hide_after_ms,
+                self.show_gen.clone(),
+                self.show_gen.load(Ordering::SeqCst),
+                self.window_visible.clone(),
+            ),
+            Ok(()) => {}
+            Err(e) => {
+                *self.suppress.lock().unwrap() = None;
+                self.status = format!("paste snippet: {e}");
+            }
+        }
+    }
+}
+
+/// Query the foreground thread before focusing clipLine. Many modern apps do
+/// not expose a Win32 caret; in that case retain the existing window position.
+#[cfg(windows)]
+fn caret_screen_position(ctx: &Context) -> Option<egui::Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let thread = GetWindowThreadProcessId(foreground, None);
+        if thread == 0 {
+            return None;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        GetGUIThreadInfo(thread, &mut info).ok()?;
+        if info.hwndCaret.is_invalid() {
+            return None;
+        }
+        let mut point = POINT {
+            x: info.rcCaret.left,
+            y: info.rcCaret.bottom,
+        };
+        if !ClientToScreen(info.hwndCaret, &mut point).as_bool() {
+            return None;
+        }
+        let scale = ctx.pixels_per_point();
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+            let size = ctx
+                .input(|i| i.viewport().outer_rect.map(|r| r.size()))
+                .unwrap_or(egui::vec2(860.0, 600.0));
+            let work = monitor_info.rcWork;
+            let width = (size.x * scale) as i32;
+            let height = (size.y * scale) as i32;
+            point.x = point
+                .x
+                .clamp(work.left, (work.right - width).max(work.left));
+            point.y = point
+                .y
+                .clamp(work.top, (work.bottom - height).max(work.top));
+        }
+        Some(egui::pos2(point.x as f32 / scale, point.y as f32 / scale))
+    }
 }
 
 /// Sleep `ms` then hide the main window (pasting keeps the target window's
 /// focus this way). The `Context` clone is safe for cross-thread use.
-fn hide_soon(ctx: Context, ms: u64, gen_slot: Arc<AtomicU64>, my_gen: u64) {
+fn hide_soon(
+    ctx: Context,
+    ms: u64,
+    gen_slot: Arc<AtomicU64>,
+    my_gen: u64,
+    visible: Arc<AtomicBool>,
+) {
     std::thread::Builder::new()
         .name("hide-timer".into())
         .spawn(move || {
@@ -1215,12 +1678,21 @@ fn hide_soon(ctx: Context, ms: u64, gen_slot: Arc<AtomicU64>, my_gen: u64) {
             // A newer show (gen bumped) cancels this stale hide.
             if gen_slot.load(Ordering::SeqCst) == my_gen {
                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                visible.store(false, Ordering::SeqCst);
             }
         })
         .ok();
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        if self.clear_on_exit {
+            if let Err(e) = self.store.clear_on_exit() {
+                eprintln!("clear history on exit failed: {e}");
+            }
+        }
+    }
+
     /// Runs even while the window is hidden (0.37 trait) — keeps history fresh.
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_update();
@@ -1285,6 +1757,18 @@ impl eframe::App for App {
                         }
                     }
                 });
+                ui.horizontal(|ui| {
+                    if ui.button("Labels").clicked() {
+                        self.refresh_labels();
+                        self.labels_open = true;
+                    }
+                    if ui.button("Delete date range").clicked() {
+                        self.delete_confirmation = Some(false);
+                    }
+                    if ui.button("Delete all history").clicked() {
+                        self.delete_confirmation = Some(true);
+                    }
+                });
             });
         }
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -1306,6 +1790,7 @@ impl eframe::App for App {
             Tab::History => self.history_ui(ui),
             Tab::Snippets => self.snippets_ui(ui),
         });
+        self.history_dialogs(ui.ctx());
     }
 }
 

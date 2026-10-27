@@ -80,6 +80,7 @@ pub struct Snippet {
 pub struct Store {
     conn: Mutex<Connection>,
     snips_attached: AtomicBool,
+    stopped: AtomicBool,
     #[allow(dead_code)]
     path: PathBuf,
 }
@@ -99,6 +100,13 @@ CREATE TABLE IF NOT EXISTS log(
   tags TEXT not null default ',',
   url TEXT not null default '');
 CREATE TABLE IF NOT EXISTS options(key CHAR(30) PRIMARY KEY not null default '', value TEXT not null default '');
+-- Side metadata does not change ClipDiary's log schema or gzip envelope.
+CREATE TABLE IF NOT EXISTS clipline_format_names(
+  log_id INTEGER NOT NULL, block_index INTEGER NOT NULL, name TEXT NOT NULL,
+  PRIMARY KEY(log_id, block_index));
+CREATE TRIGGER IF NOT EXISTS clipline_format_names_delete AFTER DELETE ON log BEGIN
+  DELETE FROM clipline_format_names WHERE log_id=old.id;
+END;
 ";
 
 /// External-content FTS5 mirror of log(title,appname,url), kept in sync by triggers.
@@ -229,6 +237,7 @@ impl Store {
         Ok(Store {
             conn: Mutex::new(conn),
             snips_attached: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             path: path.to_path_buf(),
         })
     }
@@ -271,7 +280,11 @@ impl Store {
         let text = text_of(&ev.blocks);
         let (title, url, kind) = classify(&text, &ev.blocks);
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        if self.stopped.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO log(title,type,data,datasize,appname,apptitle,starred,tags,url)
              VALUES(?1,?2,?3,?4,?5,?6,0,',',?7)",
             params![
@@ -284,7 +297,16 @@ impl Store {
                 url
             ],
         )?;
-        Ok(conn.last_insert_rowid() as u64)
+        let id = tx.last_insert_rowid();
+        for (index, block) in ev.blocks.iter().enumerate() {
+            if let Format::Registered(_, name) = &block.format {
+                if !name.is_empty() {
+                    tx.execute("INSERT INTO clipline_format_names(log_id,block_index,name) VALUES(?1,?2,?3)", params![id, index as i64, name])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(id as u64)
     }
 
     pub fn list(&self, f: &Filter) -> anyhow::Result<Vec<ClipRow>> {
@@ -340,8 +362,23 @@ impl Store {
             conn.query_row("SELECT data FROM log WHERE id=?1", params![id], |r| {
                 r.get(0)
             })?;
-        drop(conn);
-        envelope::unpack(&blob)
+        let mut blocks = envelope::unpack(&blob)?;
+        let mut stmt =
+            conn.prepare("SELECT block_index,name FROM clipline_format_names WHERE log_id=?1")?;
+        let names = stmt.query_map(params![id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for entry in names {
+            let (index, name) = entry?;
+            if let Some(Block {
+                format: Format::Registered(_, stored_name),
+                ..
+            }) = blocks.get_mut(usize::try_from(index).unwrap_or(usize::MAX))
+            {
+                *stored_name = name;
+            }
+        }
+        Ok(blocks)
     }
 
     pub fn set_star(&self, id: i64, on: bool) -> anyhow::Result<()> {
@@ -365,10 +402,99 @@ impl Store {
         Ok(())
     }
 
+    /// Return distinct labels across the entire history, not just visible rows.
+    pub fn labels(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT tags FROM log")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut labels = std::collections::BTreeSet::new();
+        for row in rows {
+            for tag in row?.split(',').filter(|tag| !tag.is_empty()) {
+                labels.insert(tag.to_owned());
+            }
+        }
+        Ok(labels.into_iter().collect())
+    }
+
+    /// Rename or remove a label everywhere in one transaction.
+    pub fn change_label(&self, old: &str, new: Option<&str>) -> anyhow::Result<()> {
+        anyhow::ensure!(!old.is_empty() && !old.contains(','), "invalid label");
+        if let Some(new) = new {
+            anyhow::ensure!(!new.is_empty() && !new.contains(','), "invalid label");
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare("SELECT id, tags FROM log")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, tags) in rows {
+            let mut parts: Vec<String> = Vec::new();
+            let mut changed = false;
+            for tag in tags.split(',').filter(|s| !s.is_empty()) {
+                let replacement = if tag == old {
+                    changed = true;
+                    new
+                } else {
+                    Some(tag)
+                };
+                if let Some(tag) = replacement {
+                    if !parts.iter().any(|existing| existing == tag) {
+                        parts.push(tag.to_owned());
+                    }
+                }
+            }
+            if changed {
+                let wrapped = if parts.is_empty() {
+                    ",".to_owned()
+                } else {
+                    format!(",{},", parts.join(","))
+                };
+                tx.execute("UPDATE log SET tags=?2 WHERE id=?1", params![id, wrapped])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete(&self, ids: &[i64]) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         for id in ids {
             conn.execute("DELETE FROM log WHERE id=?1", params![id])?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_all(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM log", [])?;
+        Ok(())
+    }
+
+    /// Enable SQLite and FTS5 secure deletion for future changes.
+    pub fn set_secure_delete(&self, enabled: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.pragma_update(None, "secure_delete", enabled)?;
+        conn.execute(
+            "INSERT INTO log_fts(log_fts, rank) VALUES('secure-delete', ?1)",
+            params![i64::from(enabled)],
+        )?;
+        Ok(())
+    }
+
+    /// Stop capture writes and remove history before a normal exit.
+    pub fn clear_on_exit(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        self.stopped.store(true, Ordering::SeqCst);
+        conn.execute("DELETE FROM log", [])?;
+        // Truncate the WAL so old frames are not retained after a clean exit.
+        let (busy, _, _): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 {
+            bail!("history cleared but WAL checkpoint was blocked by another connection");
         }
         Ok(())
     }
@@ -478,9 +604,22 @@ impl Store {
             "INSERT OR IGNORE INTO log SELECT * FROM src.log;
              INSERT OR IGNORE INTO options SELECT * FROM src.options;",
         );
+        // Legacy ClipDiary files have no side table. For clipLine sources,
+        // copy names only when the destination row has the identical payload.
+        let has_names: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM src.sqlite_schema WHERE type='table' AND name='clipline_format_names')", [], |r| r.get(0))?;
+        let names_copy = if copy.is_ok() && has_names {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO clipline_format_names(log_id,block_index,name)
+                SELECT n.log_id,n.block_index,n.name FROM src.clipline_format_names n
+                JOIN src.log s ON s.id=n.log_id JOIN main.log d ON d.id=s.id AND d.data=s.data;",
+            )
+        } else {
+            Ok(())
+        };
         let after: Result<i64, _> = conn.query_row("SELECT count(*) FROM log", [], |r| r.get(0));
         let _ = conn.execute_batch("DETACH DATABASE src;"); // never leak the attach
         copy?;
+        names_copy?;
         Ok((after? - before) as u64)
     }
 

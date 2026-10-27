@@ -177,32 +177,11 @@ impl OwnerState {
         } else {
             req.property
         };
-        let ok = match clip
-            .as_deref()
-            .and_then(|c| target_data(&c.blocks, req.target, &self.atoms))
-        {
-            // X properties carry raw bytes; x11rb change_property* takes u32
-            // words for 32-bit formats but u8 data must go through
-            // change_property8 with format=8. Serve as bytes via
-            // change_property8 regardless of word width: formats here
-            // (UTF8_STRING, ATOM lists, registered blobs) are all 8-bit
-            // properties per ICCCM except ATOM, whose u32 list is byte-packed
-            // identically on little-endian — so pack every payload as bytes.
-            Some((ty, data)) => self
-                .conn
-                .change_property8(
-                    PropMode::REPLACE,
-                    req.requestor,
-                    prop,
-                    ty,
-                    data.iter()
-                        .map(|w| w.to_le_bytes())
-                        .flatten()
-                        .collect::<Vec<u8>>()
-                        .as_slice(),
-                )
-                .is_ok(),
-            None => false,
+        let ok = if let Some(data) = clip.as_deref() {
+            self.write_selection_property(req.requestor, prop, req.target, &data.blocks)
+                .unwrap_or(false)
+        } else {
+            false
         };
         let _ = self.conn.send_event(
             false,
@@ -221,69 +200,76 @@ impl OwnerState {
         let _ = self.conn.flush();
         Ok(())
     }
-}
-
-/// Data for one requested target: (property type, u32 words).
-/// TARGETS gets the atom list; text targets get UTF-8 as UTF8_STRING-typed
-/// property; registered blocks answer only their exact atom.
-fn target_data(
-    blocks: &[clip_line_core::capture::Block],
-    target: Atom,
-    a: &PAtoms,
-) -> Option<(Atom, Vec<u32>)> {
-    if target == a.TARGETS {
-        let mut list: Vec<u32> = text_target_atoms(a).to_vec();
+    fn write_selection_property(
+        &self,
+        requestor: Window,
+        prop: Atom,
+        target: Atom,
+        blocks: &[clip_line_core::capture::Block],
+    ) -> Result<bool> {
+        let mut formats = Vec::new();
         for b in blocks {
             if let clip_line_core::capture::Format::Registered(_, name) = &b.format {
-                if let Some(atom) = registered_atom(a, name) {
-                    list.push(atom);
+                if !name.is_empty() {
+                    let atom = self
+                        .conn
+                        .intern_atom(false, canonical_x11_name(name).as_bytes())?
+                        .reply()?
+                        .atom;
+                    formats.push((atom, &b.bytes));
                 }
             }
         }
-        return Some((AtomEnum::ATOM.into(), list));
-    }
-    if is_text_target(target, a) {
-        let tb = blocks
+        let text = blocks
             .iter()
-            .find(|b| b.format == clip_line_core::capture::Format::UnicodeText)?;
-        let s = decode_utf16(&tb.bytes);
-        return Some((a.UTF8_STRING, s.bytes().map(|b| b as u32).collect()));
-    }
-    // Registered block: match by stored atom name.
-    for b in blocks {
-        if let clip_line_core::capture::Format::Registered(_, name) = &b.format {
-            if registered_atom(a, name) == Some(target) {
-                let words: Vec<u32> = b
-                    .bytes
-                    .chunks_exact(4)
-                    .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
-                    .collect();
-                return Some((AtomEnum::PIXMAP.into(), words));
+            .find(|b| b.format == clip_line_core::capture::Format::UnicodeText);
+        if target == self.atoms.TARGETS {
+            let mut targets = vec![self.atoms.TARGETS];
+            if text.is_some() {
+                targets.extend(text_target_atoms(&self.atoms));
+            }
+            targets.extend(formats.iter().map(|(atom, _)| *atom));
+            self.conn
+                .change_property32(PropMode::REPLACE, requestor, prop, AtomEnum::ATOM, &targets)?
+                .check()?;
+            return Ok(true);
+        }
+        if is_text_target(target, &self.atoms) {
+            if let Some(block) = text {
+                let text = decode_utf16(&block.bytes);
+                self.conn
+                    .change_property8(PropMode::REPLACE, requestor, prop, target, text.as_bytes())?
+                    .check()?;
+                return Ok(true);
             }
         }
+        if let Some((_, bytes)) = formats.iter().find(|(atom, _)| *atom == target) {
+            self.conn
+                .change_property8(PropMode::REPLACE, requestor, prop, target, bytes)?
+                .check()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
-    None
+}
+
+/// Map common platform image names to standard MIME targets.
+fn canonical_x11_name(name: &str) -> &str {
+    match name {
+        "PNG" | "public.png" => "image/png",
+        "TIFF" | "public.tiff" => "image/tiff",
+        _ => name,
+    }
 }
 
 fn text_target_atoms(a: &PAtoms) -> Vec<Atom> {
-    vec![
-        a.UTF8_STRING,
-        a.TEXT,
-        a.STRING,
-        a.COMPOUND_TEXT,
-        a.TEXT_PLAIN_MIME,
-    ]
+    // These targets all accept UTF-8; STRING/COMPOUND_TEXT require different
+    // encodings and must not be advertised as UTF-8.
+    vec![a.UTF8_STRING, a.TEXT_PLAIN_MIME]
 }
 
 fn is_text_target(t: Atom, a: &PAtoms) -> bool {
     text_target_atoms(a).contains(&t)
-}
-
-fn registered_atom(a: &PAtoms, name: &str) -> Option<Atom> {
-    Some(match name {
-        _ if name == "text/plain" => a.TEXT_PLAIN_MIME,
-        _ => return None,
-    })
 }
 
 /// Stored UTF-16LE block bytes -> String (stops at wide NUL).
@@ -384,7 +370,18 @@ fn ascii_keycode(c: char) -> Option<(u8, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ascii_keycode, decode_utf16};
+    use super::{ascii_keycode, canonical_x11_name, decode_utf16};
+
+    #[test]
+    fn common_image_formats_use_mime_targets() {
+        assert_eq!(canonical_x11_name("PNG"), "image/png");
+        assert_eq!(canonical_x11_name("public.png"), "image/png");
+        assert_eq!(canonical_x11_name("TIFF"), "image/tiff");
+        assert_eq!(
+            canonical_x11_name("application/x-custom"),
+            "application/x-custom"
+        );
+    }
 
     #[test]
     fn utf16_round_trips() {

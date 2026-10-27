@@ -18,6 +18,10 @@ atom_manager! {
         MULTIPLE,
         INCR,
         UTF8_STRING,
+        _NET_ACTIVE_WINDOW,
+        _NET_WM_NAME,
+        WM_CLASS,
+        WM_NAME,
     }
 }
 
@@ -25,6 +29,7 @@ pub struct X11Capture {
     conn: RustConnection,
     win: Window,
     atoms: Atoms,
+    root: Window,
 }
 
 impl X11Capture {
@@ -32,8 +37,10 @@ impl X11Capture {
         use x11rb::connection::RequestConnection;
         let (conn, screen_num) = RustConnection::connect(None).context("X11 connect failed")?;
         conn.extension_information("XFIXES")
+            .context("query XFIXES extension failed")?
             .context("X server has no XFIXES; clipboard capture impossible")?;
         let screen = conn.setup().roots.get(screen_num).context("no X screen")?;
+        let root = screen.root;
         let win = conn.generate_id()?;
         conn.create_window(
             x11rb::COPY_DEPTH_FROM_PARENT,
@@ -57,7 +64,12 @@ impl X11Capture {
         conn.xfixes_select_selection_input(win, atoms.CLIPBOARD, mask)?
             .check()?;
         let _ = conn.flush();
-        Ok(X11Capture { conn, win, atoms })
+        Ok(X11Capture {
+            conn,
+            win,
+            atoms,
+            root,
+        })
     }
 }
 
@@ -94,11 +106,11 @@ impl X11Capture {
     /// Convert-selection read of the current CLIPBOARD owner: TARGETS first,
     /// then one conversion per target. Empty when nothing decodable.
     fn read_selection(&self) -> Result<clip_line_core::capture::ClipEvent> {
-        // ponytail: source app/title need X input-focus lookup - phase 3 polish.
+        let (source_app, source_title) = self.active_window_metadata();
         let mut ev = clip_line_core::capture::ClipEvent {
             blocks: Vec::new(),
-            source_app: String::new(),
-            source_title: String::new(),
+            source_app,
+            source_title,
         };
         let Some(targets) = self.targets() else {
             return Ok(ev);
@@ -117,6 +129,50 @@ impl X11Capture {
         }
         ev.blocks = blocks;
         Ok(ev)
+    }
+
+    /// The active top-level window is a best-effort source; X11 selection
+    /// ownership alone can belong to a hidden clipboard helper window.
+    fn active_window_metadata(&self) -> (String, String) {
+        let active = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms._NET_ACTIVE_WINDOW,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut values| values.next()));
+        let Some(window) = active.filter(|w| *w != x11rb::NONE) else {
+            return (String::new(), String::new());
+        };
+        let read = |atom| {
+            self.conn
+                .get_property(false, window, atom, AtomEnum::ANY, 0, 4096)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.value)
+                .unwrap_or_default()
+        };
+        let class = read(self.atoms.WM_CLASS);
+        // WM_CLASS is instance NUL class NUL. Prefer the human-readable class.
+        let mut fields = class.split(|b| *b == 0).filter(|s| !s.is_empty());
+        let instance = fields.next().unwrap_or_default();
+        let app = fields.next().unwrap_or(instance);
+        let mut title = read(self.atoms._NET_WM_NAME);
+        if title.is_empty() {
+            title = read(self.atoms.WM_NAME);
+        }
+        (
+            String::from_utf8_lossy(app).into_owned(),
+            String::from_utf8_lossy(&title)
+                .trim_end_matches('\0')
+                .to_owned(),
+        )
     }
 
     /// TARGETS list of the current selection, None when unobtainable.

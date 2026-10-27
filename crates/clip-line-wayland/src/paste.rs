@@ -51,7 +51,14 @@ impl Paster for WaylandPaster {
             PasteMode::SetOnly => Ok(()),
             PasteMode::InjectCtrlV => {
                 let tool = pick_tool().ok_or_else(|| anyhow::anyhow!(missing_tool_error(mode)))?;
-                let status = Command::new(tool).arg("key").arg("ctrl+v").status()?;
+                let status = match tool {
+                    "ydotool" => Command::new(tool)
+                        .args(["key", "29:1", "47:1", "47:0", "29:0"])
+                        .status()?,
+                    _ => Command::new(tool)
+                        .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
+                        .status()?,
+                };
                 if status.success() {
                     Ok(())
                 } else {
@@ -85,8 +92,9 @@ pub fn set_clipboard(blocks: &[Block]) -> anyhow::Result<()> {
     if sources.is_empty() {
         anyhow::bail!("no blocks with a Wayland-representable format");
     }
-    copy::Options::new()
-        .serve_requests(ServeRequests::Unlimited)
+    let mut options = copy::Options::new();
+    options.serve_requests(ServeRequests::Unlimited);
+    options
         .copy_multi(sources)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
@@ -96,7 +104,9 @@ pub fn set_clipboard(blocks: &[Block]) -> anyhow::Result<()> {
 fn block_source(b: &Block) -> Option<MimeSource> {
     let (bytes, mime): (Vec<u8>, CopyMime) = match &b.format {
         Format::UnicodeText => (utf16_to_utf8(&b.bytes), CopyMime::Text),
-        Format::Registered(_, name) if name == "image/png" => {
+        Format::Registered(_, name)
+            if matches!(name.as_str(), "image/png" | "PNG" | "public.png") =>
+        {
             (b.bytes.clone(), CopyMime::Specific("image/png".into()))
         }
         Format::FileDrop => (

@@ -114,7 +114,11 @@ pub fn string_to_utf16_bytes(s: &str) -> Vec<u8> {
 /// Split a UTF-16LE NUL-separated file-URL list into Strings (storage form
 /// written by `read_file_urls`; consumed by the paster).
 pub fn file_urls_from_bytes(bytes: &[u8]) -> Vec<String> {
-    utf16_bytes_to_string(bytes)
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
         .split('\0')
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -244,7 +248,7 @@ mod tests {
         );
         match map_block("public.png", vec![]).format {
             Format::Registered(id, name) => {
-                assert_eq!(id, 8, "PNG rides the DIB id so the store sees an image");
+                assert_eq!(id, 2, "PNG uses a registered id rather than the DIB id");
                 assert_eq!(name, "PNG");
             }
             f => panic!("png mapped to {f:?}"),

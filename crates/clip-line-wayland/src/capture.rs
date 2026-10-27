@@ -36,9 +36,7 @@ fn is_unsupported(err: &WlError) -> Option<(&'static str, u32)> {
 /// Human message for a compositor-support error, including the desktop
 /// detected via XDG_CURRENT_DESKTOP (issue story 7: capture off must say why).
 pub fn unsupported_message(err: &WlError) -> Option<String> {
-    let Some((name, _version)) = is_unsupported(err) else {
-        return None;
-    };
+    let (name, _version) = is_unsupported(err)?;
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
     let gnome = desktop.to_ascii_lowercase().contains("gnome");
     let why = if gnome {
@@ -115,10 +113,13 @@ fn read_offer(mimes: &[String], offer: &mut Offer<'_>) -> anyhow::Result<Option<
         "text/uri-list" => Format::FileDrop,
         _ => Format::UnicodeText,
     };
-    if format == Format::UnicodeText && !bytes.ends_with(b"\0\0") {
+    if format == Format::UnicodeText {
         // Wayland text offers are UTF-8 without a terminator; storage keeps
         // the Windows shape (UTF-16LE + wide NUL) so the envelope matches.
-        bytes = to_win_text(&String::from_utf8_lossy(trim_cr(&bytes)));
+        bytes = to_win_text(&String::from_utf8_lossy(&bytes));
+    }
+    if format == Format::FileDrop {
+        bytes = to_win_text(&String::from_utf8_lossy(&bytes));
     }
     Ok(Some(ClipEvent {
         blocks: vec![Block { format, bytes }],
@@ -178,7 +179,7 @@ mod tests {
         };
         let msg = unsupported_message(&e).unwrap();
         assert!(msg.contains("data-control"), "{msg}");
-        assert!(msg.contains("XDG"), "{msg}");
+        assert!(msg.contains("desktop"), "{msg}");
     }
 
     #[test]

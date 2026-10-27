@@ -10,6 +10,63 @@ pub struct Config {
     pub storage: Storage,
     pub paste: Paste,
     pub ui: Ui,
+    pub privacy: Privacy,
+    pub capture: CaptureRules,
+}
+
+/// Capture exclusions. A matching rule discards the entire clipboard event.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CaptureRules {
+    pub excluded_apps: Vec<String>,
+    pub excluded_formats: Vec<String>,
+    pub max_clip_mb: Option<u64>,
+    pub max_image_mb: Option<u64>,
+}
+
+impl CaptureRules {
+    pub fn excludes(&self, event: &crate::capture::ClipEvent) -> bool {
+        use crate::capture::Format;
+        if self
+            .excluded_apps
+            .iter()
+            .any(|s| !s.is_empty() && s.eq_ignore_ascii_case(&event.source_app))
+        {
+            return true;
+        }
+        let total = event
+            .blocks
+            .iter()
+            .fold(0u64, |n, b| n.saturating_add(b.bytes.len() as u64));
+        if self
+            .max_clip_mb
+            .is_some_and(|max| total > max.saturating_mul(1024 * 1024))
+        {
+            return true;
+        }
+        event.blocks.iter().any(|block| {
+            let name = match &block.format {
+                Format::UnicodeText => "CF_UNICODETEXT",
+                Format::ImageDib => "CF_DIB",
+                Format::ImageDibV5 => "CF_DIBV5",
+                Format::FileDrop => "CF_HDROP",
+                Format::Registered(_, name) => name,
+            };
+            self.excluded_formats.iter().any(|s| {
+                s.eq_ignore_ascii_case(name) || s == &block.format.envelope_id().to_string()
+            }) || (matches!(block.format, Format::ImageDib | Format::ImageDibV5)
+                && self
+                    .max_image_mb
+                    .is_some_and(|max| block.bytes.len() as u64 > max.saturating_mul(1024 * 1024)))
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Privacy {
+    pub clear_on_exit: bool,
+    pub secure_delete: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

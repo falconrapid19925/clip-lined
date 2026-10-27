@@ -38,6 +38,43 @@ fn count(store: &Store) -> usize {
 }
 
 #[test]
+fn labels_are_managed_across_history() {
+    let (store, _) = temp_store("labels-management");
+    let a = store.append(&text_event("one")).unwrap() as i64;
+    let b = store.append(&text_event("two")).unwrap() as i64;
+    store
+        .set_tags(a, &["work".into(), "shared".into()])
+        .unwrap();
+    store.set_tags(b, &["work".into(), "other".into()]).unwrap();
+    assert_eq!(store.labels().unwrap(), vec!["other", "shared", "work"]);
+    store.change_label("work", Some("shared")).unwrap();
+    let rows = store.list(&Filter::default()).unwrap();
+    assert_eq!(rows.iter().find(|r| r.id == a).unwrap().tags, ",shared,");
+    assert_eq!(
+        rows.iter().find(|r| r.id == b).unwrap().tags,
+        ",shared,other,"
+    );
+    store.change_label("shared", None).unwrap();
+    assert_eq!(store.labels().unwrap(), vec!["other"]);
+    assert!(store.change_label("other", Some("invalid,label")).is_err());
+    store.delete_all().unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+#[test]
+fn clear_on_exit_removes_history_and_blocks_late_capture() {
+    let (store, path) = temp_store("clear-exit");
+    store.set_secure_delete(true).unwrap();
+    store.append(&text_event("private text")).unwrap();
+    store.clear_on_exit().unwrap();
+    assert_eq!(store.append(&text_event("late capture")).unwrap(), 0);
+    assert_eq!(count(&store), 0);
+    drop(store);
+    let reopened = Store::open(&path, StoreOpts::default()).unwrap();
+    assert_eq!(count(&reopened), 0);
+}
+
+#[test]
 fn append_load_roundtrip() {
     let (store, _p) = temp_store("roundtrip");
     let id = store.append(&text_event("hello clipLine")).unwrap();
@@ -404,4 +441,48 @@ fn fts_odd_query_no_panic() {
             ..Default::default()
         });
     }
+}
+
+#[test]
+fn registered_format_names_survive_reopen_import_and_deletion() {
+    let (source, path) = temp_store("registered-names-source");
+    let event = ClipEvent {
+        blocks: vec![
+            Block {
+                format: Format::Registered(2, "image/png".into()),
+                bytes: vec![1, 2, 3],
+            },
+            Block {
+                format: Format::Registered(2, "public.tiff".into()),
+                bytes: vec![4, 5],
+            },
+        ],
+        source_app: String::new(),
+        source_title: String::new(),
+    };
+    let id = source.append(&event).unwrap() as i64;
+    drop(source);
+    let source = Store::open(&path, StoreOpts::default()).unwrap();
+    let formats: Vec<_> = source
+        .load_data(id)
+        .unwrap()
+        .into_iter()
+        .map(|b| b.format)
+        .collect();
+    assert_eq!(
+        formats,
+        vec![
+            Format::Registered(2, "image/png".into()),
+            Format::Registered(2, "public.tiff".into())
+        ]
+    );
+    drop(source);
+    let (destination, _) = temp_store("registered-names-destination");
+    assert_eq!(destination.import_legacy(&path).unwrap(), 1);
+    assert_eq!(
+        destination.load_data(id).unwrap()[0].format,
+        Format::Registered(2, "image/png".into())
+    );
+    destination.delete(&[id]).unwrap();
+    assert!(destination.load_data(id).is_err());
 }
