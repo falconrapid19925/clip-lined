@@ -3,10 +3,11 @@
 
 use crate::capture::{Block, ClipEvent, Format};
 use crate::envelope;
-use anyhow::Context;
+use anyhow::{Context, bail};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// log.type values, matching the original app's database.
 pub mod type_code {
@@ -29,6 +30,10 @@ pub struct Filter {
     pub query: Option<String>,
     pub starred_only: bool,
     pub kind: Option<i64>,
+    /// Inclusive `created` bounds, SQLite `CURRENT_TIMESTAMP` format
+    /// (`YYYY-MM-DD HH:MM:SS`; date-only prefixes also compare correctly).
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -39,6 +44,8 @@ impl Default for Filter {
             query: None,
             starred_only: false,
             kind: None,
+            from: None,
+            to: None,
             limit: 200,
             offset: 0,
         }
@@ -58,8 +65,21 @@ pub struct ClipRow {
     pub url: String,
 }
 
+/// Row of snippets.sdb `common` (attached second database).
+#[derive(Debug, Clone)]
+pub struct Snippet {
+    pub id: i64,
+    pub pid: i64,
+    pub pos: i64,
+    pub kind: i64,
+    pub name: String,
+    pub data: String,
+    pub description: String,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
+    snips_attached: AtomicBool,
     #[allow(dead_code)]
     path: PathBuf,
 }
@@ -79,7 +99,10 @@ CREATE TABLE IF NOT EXISTS log(
   tags TEXT not null default ',',
   url TEXT not null default '');
 CREATE TABLE IF NOT EXISTS options(key CHAR(30) PRIMARY KEY not null default '', value TEXT not null default '');
-CREATE TABLE IF NOT EXISTS common(
+";
+
+const SNIPPETS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS snippets.common(
   id INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER not null default 0,
   pos INTEGER not null default 1000, type INTEGER not null default 2,
   name TEXT not null default '', data TEXT not null default '',
@@ -95,8 +118,32 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         Ok(Store {
             conn: Mutex::new(conn),
+            snips_attached: AtomicBool::new(false),
             path: path.to_path_buf(),
         })
+    }
+
+    /// Attaches snippets.sdb as second database `snippets`; errors if already attached.
+    pub fn attach_snippets(&self, path: &Path) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if self.snips_attached.load(Ordering::Relaxed) {
+            bail!("snippets database already attached");
+        }
+        conn.execute_batch(&format!(
+            "ATTACH DATABASE '{}' AS snippets;",
+            path.display().to_string().replace('\'', "''")
+        ))
+        .with_context(|| format!("attach {}", path.display()))?;
+        conn.execute_batch(SNIPPETS_SCHEMA)?;
+        self.snips_attached.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn snips(&self) -> anyhow::Result<MutexGuard<'_, Connection>> {
+        if !self.snips_attached.load(Ordering::Relaxed) {
+            bail!("snippets database not attached");
+        }
+        Ok(self.conn.lock().unwrap())
     }
 
     /// Stores an event. Deduplicates against the last row's payload.
@@ -143,12 +190,20 @@ impl Store {
         if f.query.is_some() {
             sql.push_str(" AND (title LIKE '%'||?1||'%' OR appname LIKE '%'||?1||'%' OR url LIKE '%'||?1||'%')");
         }
-        sql.push_str(" ORDER BY id DESC LIMIT ?2 OFFSET ?3");
+        if f.from.is_some() {
+            sql.push_str(" AND created>=?2");
+        }
+        if f.to.is_some() {
+            sql.push_str(" AND created<=?3");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?4 OFFSET ?5");
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             params![
                 f.query.clone().unwrap_or_default(),
+                f.from.clone().unwrap_or_default(),
+                f.to.clone().unwrap_or_default(),
                 f.limit.max(1),
                 f.offset
             ],
@@ -188,11 +243,88 @@ impl Store {
         Ok(())
     }
 
+    /// Writes tags comma-wrapped (`,a,b,`; empty list → `,`) per interop.md.
+    pub fn set_tags(&self, id: i64, tags: &[String]) -> anyhow::Result<()> {
+        let mut wrapped = String::from(",");
+        for t in tags {
+            wrapped.push_str(t);
+            wrapped.push(',');
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE log SET tags=?2 WHERE id=?1", params![id, wrapped])?;
+        Ok(())
+    }
+
     pub fn delete(&self, ids: &[i64]) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         for id in ids {
             conn.execute("DELETE FROM log WHERE id=?1", params![id])?;
         }
+        Ok(())
+    }
+
+    /// Deletes rows with `from <= created <= to` (inclusive, string comparison
+    /// over `CURRENT_TIMESTAMP` format).
+    pub fn delete_range(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM log WHERE created>=?1 AND created<=?2",
+            params![from, to],
+        )?;
+        Ok(())
+    }
+
+    pub fn snippet_list(&self, pid: i64) -> anyhow::Result<Vec<Snippet>> {
+        let conn = self.snips()?;
+        let mut stmt = conn.prepare(
+            "SELECT id,pid,pos,type,name,data,description
+             FROM snippets.common WHERE pid=?1 ORDER BY pos,name",
+        )?;
+        let rows = stmt.query_map(params![pid], |r| {
+            Ok(Snippet {
+                id: r.get(0)?,
+                pid: r.get(1)?,
+                pos: r.get(2)?,
+                kind: r.get(3)?,
+                name: r.get(4)?,
+                data: r.get(5)?,
+                description: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Inserts a text snippet (type 2) under `pid`; returns its id.
+    pub fn snippet_add(&self, pid: i64, name: &str, data: &str) -> anyhow::Result<i64> {
+        let conn = self.snips()?;
+        conn.execute(
+            "INSERT INTO snippets.common(pid,name,data) VALUES(?1,?2,?3)",
+            params![pid, name, data],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn snippet_rename(&self, id: i64, name: &str) -> anyhow::Result<()> {
+        let conn = self.snips()?;
+        conn.execute(
+            "UPDATE snippets.common SET name=?2 WHERE id=?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn snippet_move(&self, id: i64, new_pid: i64) -> anyhow::Result<()> {
+        let conn = self.snips()?;
+        conn.execute(
+            "UPDATE snippets.common SET pid=?2 WHERE id=?1",
+            params![id, new_pid],
+        )?;
+        Ok(())
+    }
+
+    pub fn snippet_delete(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.snips()?;
+        conn.execute("DELETE FROM snippets.common WHERE id=?1", params![id])?;
         Ok(())
     }
 
