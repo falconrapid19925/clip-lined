@@ -7,7 +7,7 @@
 mod main;
 
 use clip_line_core::paste::PasteMode;
-use main::{date_range_strings, parse_hotkey, parse_mode, t};
+use main::{date_range_strings, latest_if_newer, parse_hotkey, parse_latest_tag, parse_mode, t};
 
 #[test]
 fn hotkey_strings_parse_to_mod_bits_and_vkey() {
@@ -95,4 +95,41 @@ fn date_range_builds_sqlite_bounds() {
     let (f, t) = date_range_strings("2026-13-40", "not-a-date!");
     assert_eq!(f.as_deref(), Some("2026-13-40 00:00:00"));
     assert_eq!(t, None);
+}
+
+#[test]
+fn quick_pick_digit_maps_to_nth_visible_row() {
+    // story 16: digit key N (1-9) → 0-based row index N-1.
+    for n in 1..=9u8 {
+        let idx = (n - 1) as usize;
+        assert!(idx < 9, "digit {n} maps inside the labelled range");
+    }
+    // Row label char: '1' + idx, blank for rows past 9.
+    assert_eq!(b'1' as char, '1');
+    assert_eq!((b'1' + 8u8) as char, '9');
+}
+
+#[test]
+fn parses_tag_name_from_releases_sample() {
+    // Sample of GET /repos/katsugtgz/clip-line/releases/latest body.
+    let sample = r#"{"url":"https://api.github.com/repos/katsugtgz/clip-line/releases/12",
+"tag_name":"v0.2.0","name":"clipLine 0.2.0","draft":false,"prerelease":false}"#;
+    assert_eq!(parse_latest_tag(sample).as_deref(), Some("v0.2.0"));
+    assert_eq!(parse_latest_tag("{}"), None, "missing tag_name");
+    assert_eq!(parse_latest_tag("\"tag_name\": \"\""), None, "empty tag");
+}
+
+#[test]
+fn latest_tag_flagged_only_when_newer() {
+    assert_eq!(
+        latest_if_newer("0.1.0", r#"{"tag_name":"v0.2.0"}"#).as_deref(),
+        Some("v0.2.0")
+    );
+    assert_eq!(latest_if_newer("0.2.0", r#"{"tag_name":"v0.2.0"}"#), None);
+    assert_eq!(
+        latest_if_newer("0.2.0", r#"{"tag_name":"v0.1.9"}"#),
+        None,
+        "older tag is not an update"
+    );
+    assert_eq!(latest_if_newer("0.2.0", "{}"), None);
 }

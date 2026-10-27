@@ -1,7 +1,6 @@
 //! clipLine desktop app — SPEC.md "ui" section.
 //! Main window + hide-after-paste + global hotkey toggle + tray (Windows).
 //! TODO(spec ui, phase 2 rest): caret-positioned popup viewport.
-//! TODO(phase 4, Q11): GitHub Releases update check.
 
 use clip_line_core::config::Config;
 use clip_line_core::paste::{ClipData, PasteMode};
@@ -9,6 +8,7 @@ use clip_line_core::store::{ClipRow, Filter, Snippet, Store, StoreOpts};
 use eframe::egui;
 use egui::{Context, Key, ViewportCommand};
 use egui_extras::{Column, TableBuilder};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,6 +41,9 @@ hide_after_ms = 1200
 [autostart]
 enabled = false
 
+[update]
+check_on_start = true    # Q11: GitHub Releases check on start; no telemetry
+
 # [storage]
 # path = "C:\path\to\clipline.db"
 "#;
@@ -65,12 +68,28 @@ struct Autostart {
     enabled: bool,
 }
 
+/// `[update]` (Q11). Default true via manual Default (derive would give false).
+#[derive(Debug, serde::Deserialize)]
+#[serde(default)]
+struct UpdateCfg {
+    check_on_start: bool,
+}
+
+impl Default for UpdateCfg {
+    fn default() -> Self {
+        Self {
+            check_on_start: true,
+        }
+    }
+}
+
 /// App-level config sections on top of `clip_line_core::config::Config`
 /// (storage/paste/ui). Parsed from the same TOML text; core ignores unknown keys.
 #[derive(Debug)]
 struct Extras {
     hotkeys: Hotkeys,
     autostart: Autostart,
+    update: UpdateCfg,
 }
 
 fn load_config(path: &Path) -> anyhow::Result<(Config, Extras)> {
@@ -84,7 +103,15 @@ fn load_config(path: &Path) -> anyhow::Result<(Config, Extras)> {
     };
     let hotkeys = toml::from_str::<Hotkeys>(&text).unwrap_or_else(|_| Hotkeys::with_default_show());
     let autostart = toml::from_str::<Autostart>(&text).unwrap_or_default();
-    Ok((toml::from_str(&text)?, Extras { hotkeys, autostart }))
+    let update = toml::from_str::<UpdateCfg>(&text).unwrap_or_default();
+    Ok((
+        toml::from_str(&text)?,
+        Extras {
+            hotkeys,
+            autostart,
+            update,
+        },
+    ))
 }
 
 /// "Ctrl+Shift+V" → (modifier bits Alt=1|Ctrl=2|Shift=4|Win=8, virtual key).
@@ -156,8 +183,7 @@ pub fn parse_mode(s: &str) -> PasteMode {
     }
 }
 
-/// Tray label for the current paste mode.
-#[cfg(windows)]
+/// Footer/tray label for the current paste mode.
 fn mode_str(m: PasteMode) -> &'static str {
     match m {
         PasteMode::SetOnly => "set only",
@@ -294,6 +320,10 @@ fn main() -> anyhow::Result<()> {
         opts,
         Box::new(move |cc| {
             let mut app = App::new(store, &cfg, suppress);
+            if extras.update.check_on_start {
+                let tx = app.update_tx();
+                app.spawn_update_check(tx);
+            }
             // Both want the main thread (macOS tray rule); eframe's creator runs there.
             app.register_show_hotkey(&extras.hotkeys.show);
             // Hotkey/tray events arrive on background threads → poke egui so the
@@ -448,10 +478,14 @@ struct App {
     tray: Option<tray_icon::TrayIcon>,
     #[cfg(windows)]
     tray_mode_id: tray_icon::menu::MenuId,
+    update: Option<String>, // footer line (Q11), e.g. "update: 0.2.0 available"
+    update_tx: std::sync::mpsc::Sender<String>,
+    update_rx: std::sync::mpsc::Receiver<String>,
 }
 
 impl App {
     fn new(store: Arc<Store>, cfg: &Config, suppress: SuppressSlot) -> Self {
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
         App {
             mode: parse_mode(&cfg.paste.default_mode),
             hide_after_ms: cfg.ui.hide_after_ms,
@@ -481,7 +515,36 @@ impl App {
             tray: None,
             #[cfg(windows)]
             tray_mode_id: tray_icon::menu::MenuId::new("clipline-paste-mode"),
+            update: None,
+            update_tx,
+            update_rx,
         }
+    }
+
+    /// Q11 update check, off-thread; result lands in the footer, never a modal.
+    fn spawn_update_check(&self, tx: std::sync::mpsc::Sender<String>) {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let msg = match check_for_update(&current) {
+                    Ok(Some(latest)) => format!("update: {latest} available"),
+                    Ok(None) => "up to date".into(),
+                    Err(_) => "update check failed".into(), // offline is normal
+                };
+                let _ = tx.send(msg);
+            })
+            .ok();
+    }
+
+    fn poll_update(&mut self) {
+        if let Ok(m) = self.update_rx.try_recv() {
+            self.update = Some(m);
+        }
+    }
+
+    fn update_tx(&self) -> std::sync::mpsc::Sender<String> {
+        self.update_tx.clone()
     }
 
     /// Global show/hide hotkey (spec: failure warns, app continues).
@@ -690,6 +753,37 @@ impl App {
             let cur = self.selected.map(|s| s as isize).unwrap_or(-1) + delta;
             self.selected = Some(cur.clamp(0, max) as usize);
         }
+        // story 16: quick-pick — digit N pastes the Nth visible row (only while
+        // history is on screen and the row exists; no-op otherwise).
+        let mut quick: Option<usize> = None;
+        ctx.input(|i| {
+            for (n, k) in [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+                Key::Num9,
+            ]
+            .iter()
+            .enumerate()
+            {
+                if i.key_pressed(*k) {
+                    quick = Some(n);
+                }
+            }
+        });
+        if let Some(n) = quick {
+            if self.tab == Tab::History {
+                if let Some(r) = self.rows.get(n).cloned() {
+                    let mode = self.mode;
+                    self.paste_row(ctx, r.id, mode, false);
+                }
+            }
+        }
         if ctx.input(|i| i.key_pressed(Key::Enter)) {
             self.paste_selected(ctx);
         }
@@ -752,6 +846,7 @@ impl App {
             .striped(true)
             .resizable(true)
             .column(Column::exact(24.0)) // star
+            .column(Column::exact(18.0)) // quick-pick # (story 16)
             .column(Column::exact(140.0)) // created
             .column(Column::exact(56.0)) // kind
             .column(Column::remainder()) // title
@@ -768,6 +863,14 @@ impl App {
                             let _ = self.store.set_star(r.id, !r.starred);
                             self.dirty = true;
                         }
+                    });
+                    row.col(|ui| {
+                        // 1-9 label for the visible row (quick-pick target)
+                        ui.weak(if idx < 9 {
+                            ((b'1' + idx as u8) as char).to_string()
+                        } else {
+                            " ".into()
+                        });
                     });
                     row.col(|ui| {
                         ui.label(&r.created);
@@ -911,6 +1014,7 @@ fn hide_soon(ctx: Context, ms: u64) {
 impl eframe::App for App {
     /// Runs even while the window is hidden (0.37 trait) — keeps history fresh.
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_update();
         self.refresh_if_needed();
         self.handle_global_events(ctx);
         self.handle_keys(ctx);
@@ -977,7 +1081,15 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(format!("{} clips", self.rows.len()));
                 ui.separator();
+                ui.label(mode_str(self.mode));
+                ui.separator();
                 ui.label(self.status.as_str());
+                // Q11: update status lives in the footer — never a modal, no telemetry.
+                if let Some(u) = &self.update {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(u);
+                    });
+                }
             });
         });
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
@@ -997,4 +1109,61 @@ fn kind_name(k: i64) -> &'static str {
         5 => "image",
         _ => "?",
     }
+}
+// --- Q11: GitHub Releases update check (footer status only, no telemetry) ---
+
+pub const RELEASES_URL: &str = "https://api.github.com/repos/katsugtgz/clip-line/releases/latest";
+
+/// Fetch latest tag from GitHub Releases. `current` filters stale tags.
+/// Result surfaces in the footer only (spec Q11: opt-out, no modal, no telemetry).
+pub fn check_for_update(current: &str) -> anyhow::Result<Option<String>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .build();
+    let res = agent
+        .get(RELEASES_URL)
+        .set(
+            "User-Agent",
+            concat!("clip-line/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .map_err(|e| anyhow::anyhow!("releases api: {e}"))?;
+    let mut body = String::new();
+    res.into_reader()
+        .take(64 * 1024)
+        .read_to_string(&mut body)
+        .map_err(|e| anyhow::anyhow!("read body: {e}"))?;
+    parse_latest_tag(&body).ok_or_else(|| anyhow::anyhow!("no tag_name"))?; // shape check
+    Ok(latest_if_newer(current, &body))
+}
+
+/// `"tag_name": "v0.2.0"` → `Some("v0.2.0")`; sample-shape JSON, hand-rolled scan
+/// (top-level `"tag_name"` string; JSON escaping in tags not supported).
+pub fn parse_latest_tag(body: &str) -> Option<String> {
+    let k = body.find("\"tag_name\"")?;
+    let rest = &body[k..];
+    let colon = rest.find(':')?;
+    let q1 = colon + rest[colon + 1..].find('"')? + 1;
+    let q2 = q1 + 1 + rest[q1 + 1..].find('"')?;
+    let tag = &rest[q1 + 1..q2];
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+/// Pure compare: `"0.1.0" < "0.2.0"`, `"0.1.0" < "0.1.1"`, `"0.1.0" < "0.1.0-rc1"`.
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let nums = |v: &str| -> Vec<u64> {
+        v.trim_start_matches('v')
+            .split(|c: char| !c.is_ascii_digit())
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
+    };
+    nums(latest) > nums(current)
+}
+
+/// Parse body → latest tag, only if newer than `current` (`None` = up to date).
+/// Split out so tests exercise the pure path without HTTP.
+pub fn latest_if_newer(current: &str, body: &str) -> Option<String> {
+    let tag = parse_latest_tag(body)?;
+    let clean = tag.trim_start_matches('v');
+    is_newer(clean, current).then_some(tag)
 }
