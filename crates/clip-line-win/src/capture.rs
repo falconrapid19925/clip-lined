@@ -4,12 +4,16 @@ use clip_line_core::capture::{Block, Capture, ClipEvent, Format};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardFormatNameW, OpenClipboard, RemoveClipboardFormatListener,
+    GetClipboardFormatNameW, GetClipboardOwner, OpenClipboard, RemoveClipboardFormatListener,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
+    GetWindowThreadProcessId, MSG, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLIPBOARDUPDATE,
 };
 use windows::core::PCWSTR;
 
@@ -83,7 +87,15 @@ impl Capture for WinCapture {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
                 if msg.message == WM_CLIPBOARDUPDATE {
-                    return read_clipboard();
+                    if crate::self_write::is_self_write() {
+                        continue;
+                    }
+                    // EmptyClipboard or foreign formats we can't read leave
+                    // zero blocks — that state carries no clip; keep waiting.
+                    let ev = read_clipboard()?;
+                    if !ev.blocks.is_empty() {
+                        return Ok(ev);
+                    }
                 }
             }
         }
@@ -92,15 +104,21 @@ impl Capture for WinCapture {
 
 unsafe fn read_clipboard() -> anyhow::Result<ClipEvent> {
     unsafe {
-        let (app, title) = foreground_app();
         let mut blocks = Vec::new();
         if OpenClipboard(None).is_err() {
             return Ok(ClipEvent {
                 blocks,
-                source_app: app,
-                source_title: title,
+                source_app: String::new(),
+                source_title: String::new(),
             });
         }
+        // The foreground window may belong to an unrelated application when
+        // a background process writes the clipboard. Attribute the event to
+        // its actual owner, or leave it unknown so exclusion rules fail closed.
+        let (app, title) = GetClipboardOwner()
+            .ok()
+            .map(|hwnd| owner_app(hwnd))
+            .unwrap_or_default();
         let mut fmt = EnumClipboardFormats(0);
         while fmt != 0 {
             if let Some(b) = read_format(fmt) {
@@ -169,7 +187,63 @@ unsafe fn read_format(fmt: u32) -> Option<Block> {
     }
 }
 
-unsafe fn foreground_app() -> (String, String) {
-    // ponytail: process-name + window-title lookup lands with paste polish (phase 2)
-    (String::new(), String::new())
+/// Clipboard owner's process name (basename, no `.exe`) and window title.
+/// Unknown steps degrade to "" — never block capture on lookup failure.
+unsafe fn owner_app(hwnd: HWND) -> (String, String) {
+    unsafe {
+        let app = owner_process_name(hwnd).unwrap_or_default();
+        let title = owner_title(hwnd).unwrap_or_default();
+        (app, title)
+    }
+}
+
+unsafe fn owner_process_name(hwnd: HWND) -> Option<String> {
+    unsafe {
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        if r.is_err() {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let base = path.rsplit(['/', '\\']).next().unwrap_or(&path);
+        let base = if base
+            .get(base.len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        {
+            &base[..base.len() - 4]
+        } else {
+            base
+        };
+        Some(base.to_string())
+    }
+}
+
+unsafe fn owner_title(hwnd: HWND) -> Option<String> {
+    unsafe {
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        if n == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..n as usize]))
+    }
 }

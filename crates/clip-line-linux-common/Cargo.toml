@@ -1,0 +1,15 @@
+[package]
+name = "clip-line-linux-common"
+description = "ClipDiary format conversion for Linux clipboard adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+url = "2"

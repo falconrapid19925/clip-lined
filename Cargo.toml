@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/clip-line-core", "crates/clip-line-win", "crates/clip-line-app"]
+members = ["crates/clip-line-core", "crates/clip-line-win", "crates/clip-line-app", "crates/clip-line-linux-common", "crates/clip-line-x11", "crates/clip-line-wayland", "crates/clip-line-macos"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/katsugtgz/clip-line"
 homepage = "https://katsugtgz.github.io/clip-line"

@@ -79,3 +79,10 @@ with an HTML Format companion block).
 Rows written by clipLine keep this shape so both programs can read the same
 history database. Block numbering (`start at 1`) was inferred from samples and
 is the one field still to verify against a wider corpus.
+
+Registered clipboard format IDs can change between Windows sessions. clipLine
+stores their names in an additional `clipline_format_names` table and registers
+those names again when pasting; the `log` schema and payload remain unchanged.
+Ordinary SQLite triggers remove this metadata when another application deletes
+or replaces a row. Older ClipDiary rows contain only numeric IDs, so their
+registered formats cannot always be identified across sessions.

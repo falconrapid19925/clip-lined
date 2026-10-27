@@ -27,6 +27,16 @@ fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
     (Store::open(&p, StoreOpts::default()).unwrap(), p)
 }
 
+fn count(store: &Store) -> usize {
+    store
+        .list(&Filter {
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap()
+        .len()
+}
+
 #[test]
 fn append_load_roundtrip() {
     let (store, _p) = temp_store("roundtrip");
@@ -43,6 +53,42 @@ fn append_load_roundtrip() {
         .collect();
     let s = String::from_utf16(&units).unwrap();
     assert_eq!(s.trim_end_matches('\0'), "hello clipLine");
+}
+
+#[test]
+fn registered_format_name_survives_reopen_and_is_forgotten_on_external_replace() {
+    let (store, path) = temp_store("format-name");
+    let event = ClipEvent {
+        blocks: vec![Block {
+            format: Format::Registered(0xc123, "HTML Format".into()),
+            bytes: b"content".to_vec(),
+        }],
+        source_app: String::new(),
+        source_title: String::new(),
+    };
+    let id = store.append(&event).unwrap() as i64;
+    drop(store);
+    let store = Store::open(&path, StoreOpts::default()).unwrap();
+    assert_eq!(
+        store.load_data(id).unwrap()[0].format,
+        Format::Registered(0xc123, "HTML Format".into())
+    );
+    let replacement = clip_line_core::envelope::pack(&[Block {
+        format: Format::Registered(0xc123, String::new()),
+        bytes: b"new content".to_vec(),
+    }])
+    .unwrap();
+    let external = rusqlite::Connection::open(&path).unwrap();
+    external
+        .execute(
+            "UPDATE log SET data=?1, datasize=?2 WHERE id=?3",
+            rusqlite::params![replacement, replacement.len() as i64, id],
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_data(id).unwrap()[0].format,
+        Format::Registered(0xc123, String::new())
+    );
 }
 
 #[test]
@@ -125,7 +171,251 @@ fn star_search_delete() {
     assert_eq!(store.list(&f).unwrap().len(), 1);
 
     store.delete(&[a as i64]).unwrap();
-    assert_eq!(store.list(&Filter::default()).unwrap().len(), 1);
+    assert_eq!(count(&store), 1);
+}
+
+#[test]
+fn search_tracks_other_connections_and_preserves_substring_matching() {
+    let (store, p) = temp_store("search-external");
+    let id = store.append(&text_event("Alpha needle")).unwrap() as i64;
+    let find = |query: &str| {
+        store
+            .list(&Filter {
+                query: Some(query.into()),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    assert_eq!(find("pha nee").len(), 1);
+    assert_eq!(find("NEEDLE").len(), 1);
+    assert_eq!(find("ha").len(), 1);
+    assert_eq!(find("pha%needle").len(), 1);
+    let external = rusqlite::Connection::open(&p).unwrap();
+    external
+        .execute("UPDATE log SET title='replacement' WHERE id=?1", [id])
+        .unwrap();
+    assert!(find("needle").is_empty());
+    assert_eq!(find("placement").len(), 1);
+    external
+        .execute("DELETE FROM log WHERE id=?1", [id])
+        .unwrap();
+    assert!(find("placement").is_empty());
+}
+
+#[test]
+fn clear_history_and_checkpoint() {
+    let (store, _) = temp_store("privacy");
+    store.set_secure_delete(true).unwrap();
+    store.append(&text_event("delete me")).unwrap();
+    store.clear_history().unwrap();
+    store.checkpoint_truncate().unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+#[cfg(not(feature = "encryption"))]
+#[test]
+fn encryption_key_is_not_silently_ignored() {
+    let dir = std::env::temp_dir().join(format!("clipline-no-cipher-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.db");
+    let err = match Store::open(
+        &path,
+        StoreOpts {
+            key: Some("secret".into()),
+        },
+    ) {
+        Ok(_) => panic!("unencrypted build accepted a key"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("encryption cargo feature"));
+    assert!(!path.exists());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_database_requires_the_correct_key() {
+    let dir = std::env::temp_dir().join(format!("clipline-cipher-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.db");
+    let options = || StoreOpts {
+        key: Some("correct horse".into()),
+    };
+    let snippets = dir.join("snippets.sdb");
+    let plaintext_snippets = dir.join("plaintext-snippets.sdb");
+    {
+        let plain = Store::open(&dir.join("plain.db"), StoreOpts::default()).unwrap();
+        let legacy_id = plain.append(&text_event("legacy import")).unwrap() as i64;
+        plain.set_star(legacy_id, true).unwrap();
+        plain.set_tags(legacy_id, &["Legacy".into()]).unwrap();
+        plain.attach_snippets(&plaintext_snippets).unwrap();
+        plain.snippet_add(0, "plain", "plain contents").unwrap();
+    }
+    {
+        let store = Store::open(&path, options()).unwrap();
+        assert_eq!(store.import_legacy(&dir.join("plain.db")).unwrap(), 1);
+        store.append(&text_event("secret content")).unwrap();
+        assert!(store.attach_snippets(&plaintext_snippets).is_err());
+        store.attach_snippets(&snippets).unwrap();
+        store
+            .snippet_add(0, "private snippet", "private snippet contents")
+            .unwrap();
+    }
+    assert!(
+        !std::fs::read(&path)
+            .unwrap()
+            .starts_with(b"SQLite format 3\0")
+    );
+    let snippets_bytes = std::fs::read(&snippets).unwrap();
+    assert!(!snippets_bytes.starts_with(b"SQLite format 3\0"));
+    assert!(
+        !snippets_bytes
+            .windows(b"private snippet contents".len())
+            .any(|w| w == b"private snippet contents")
+    );
+    assert!(Store::open(&path, StoreOpts::default()).is_err());
+    assert!(
+        Store::open(
+            &path,
+            StoreOpts {
+                key: Some("wrong".into())
+            }
+        )
+        .is_err()
+    );
+    let store = Store::open(&path, options()).unwrap();
+    assert_eq!(count(&store), 2);
+    let imported = store
+        .list(&Filter::default())
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == 1)
+        .unwrap();
+    assert!(imported.starred);
+    assert_eq!(imported.tags, ",Legacy,");
+    store.attach_snippets(&snippets).unwrap();
+    assert_eq!(
+        store.snippet_list(0).unwrap()[0].data,
+        "private snippet contents"
+    );
+}
+
+#[test]
+fn set_tags_comma_wrapped() {
+    let (store, _p) = temp_store("tags");
+    let a = store.append(&text_event("tagged")).unwrap() as i64;
+    store
+        .set_tags(a, &["Important".into(), "Work".into()])
+        .unwrap();
+    assert_eq!(
+        store.list(&Filter::default()).unwrap()[0].tags,
+        ",Important,Work,"
+    );
+    store.set_tags(a, &[]).unwrap();
+    assert_eq!(store.list(&Filter::default()).unwrap()[0].tags, ",");
+}
+
+#[test]
+fn label_manager_renames_merges_and_deletes_exact_tags_across_history() {
+    let (store, _) = temp_store("labels");
+    let first = store.append(&text_event("first")).unwrap() as i64;
+    let second = store.append(&text_event("second")).unwrap() as i64;
+    store
+        .set_tags(first, &["work".into(), "workshop".into(), "home".into()])
+        .unwrap();
+    store
+        .set_tags(second, &["work".into(), "home".into()])
+        .unwrap();
+    assert_eq!(
+        store.list_all_tags().unwrap(),
+        vec!["home", "work", "workshop"]
+    );
+    store.rename_tag("work", "home").unwrap();
+    let rows = store.list(&Filter::default()).unwrap();
+    assert_eq!(
+        rows.iter().find(|row| row.id == first).unwrap().tags,
+        ",home,workshop,"
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.id == second).unwrap().tags,
+        ",home,"
+    );
+    assert!(store.rename_tag("home", "bad,label").is_err());
+    store.delete_tag("home").unwrap();
+    let rows = store.list(&Filter::default()).unwrap();
+    assert_eq!(
+        rows.iter().find(|row| row.id == first).unwrap().tags,
+        ",workshop,"
+    );
+    assert_eq!(rows.iter().find(|row| row.id == second).unwrap().tags, ",");
+    assert_eq!(store.list_all_tags().unwrap(), vec!["workshop"]);
+}
+
+#[test]
+fn delete_range_inclusive() {
+    let (store, p) = temp_store("range");
+    for t in ["alpha", "beta"] {
+        store.append(&text_event(t)).unwrap();
+    }
+    // rewrite created to fixed stamps: 2 old (Oct 20-21), 1 new (Oct 27)
+    let conn = rusqlite::Connection::open(&p).unwrap();
+    conn.execute_batch(
+        "UPDATE log SET created='2026-10-20 10:00:00' WHERE id=1;
+         UPDATE log SET created='2026-10-21 10:00:00' WHERE id=2;",
+    )
+    .unwrap();
+    drop(conn);
+    store.append(&text_event("fresh")).unwrap(); // created = now (2026-10-27)
+
+    // window strictly between stamps: boundary rows at both ends survive? no — inclusive:
+    store
+        .delete_range("2026-10-20 10:00:00", "2026-10-21 10:00:00")
+        .unwrap();
+    assert_eq!(count(&store), 1, "boundary rows deleted, fresh survives");
+
+    // wide range that clearly covers all rows
+    store
+        .delete_range("2000-01-01 00:00:00", "2100-01-01 00:00:00")
+        .unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+#[test]
+fn filter_date_bounds() {
+    let (store, p) = temp_store("filter-dates");
+    store.append(&text_event("old")).unwrap();
+    let created: String = {
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.query_row("SELECT created FROM log WHERE id=1", [], |r| r.get(0))
+            .unwrap()
+    };
+    // to = day before created → excluded
+    let day = &created[..10];
+    let mut prev = day.to_string();
+    prev.replace_range(8..10, "01"); // same month, earlier day
+    assert_eq!(
+        store
+            .list(&Filter {
+                to: Some(prev),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // range covering today → included
+    assert_eq!(
+        store
+            .list(&Filter {
+                from: Some("2000-01-01".into()),
+                to: Some("2100-01-01".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -139,13 +429,83 @@ fn import_legacy_preserves_rows() {
     let legacy = src_dir.join("legacy.db");
     {
         let s = Store::open(&legacy, StoreOpts::default()).unwrap();
-        s.append(&text_event("legacy row one")).unwrap();
+        let id = s.append(&text_event("legacy row one")).unwrap() as i64;
+        s.set_star(id, true).unwrap();
+        s.set_tags(id, &["Important".into()]).unwrap();
         s.append(&text_event("https://legacy.example.com")).unwrap();
     }
     let (store, _p) = temp_store("import");
     let n = store.import_legacy(&legacy).unwrap();
     assert_eq!(n, 2);
-    assert_eq!(store.list(&Filter::default()).unwrap().len(), 2);
+    assert_eq!(count(&store), 2);
+    let rows = store.list(&Filter::default()).unwrap();
+    let preserved = rows.iter().find(|row| row.id == 1).unwrap();
+    assert!(preserved.starred);
+    assert_eq!(preserved.tags, ",Important,");
+}
+
+#[test]
+fn locked_or_invalid_legacy_import_fails_and_does_not_prevent_retry() {
+    let (store, path) = temp_store("invalid-legacy");
+    let invalid = path.parent().unwrap().join("locked.db");
+    std::fs::write(&invalid, b"not a plaintext sqlite database").unwrap();
+    let err = store.import_legacy(&invalid).unwrap_err();
+    assert!(format!("{err:#}").contains("locked legacy databases must be unlocked"));
+    let legacy = path.parent().unwrap().join("valid.db");
+    {
+        let other = Store::open(&legacy, StoreOpts::default()).unwrap();
+        other.append(&text_event("import after failure")).unwrap();
+    }
+    assert_eq!(store.import_legacy(&legacy).unwrap(), 1);
+}
+
+#[test]
+fn snippets_tree_ops() {
+    let (store, p) = temp_store("snippets");
+    let sdb = p.parent().unwrap().join("snippets.sdb");
+
+    // ops before attach must fail
+    assert!(store.snippet_list(0).is_err());
+
+    store.attach_snippets(&sdb).unwrap();
+    assert!(store.attach_snippets(&sdb).is_err(), "second attach errors");
+
+    let root = store.snippet_add_folder(0, "Canned replies").unwrap();
+    let child = store.snippet_add(root, "greet", "Hello there!").unwrap();
+
+    let roots = store.snippet_list(0).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].id, root);
+    assert_eq!(roots[0].kind, 1);
+
+    let kids = store.snippet_list(root).unwrap();
+    assert_eq!(kids.len(), 1);
+    assert_eq!(kids[0].id, child);
+    assert_eq!(kids[0].data, "Hello there!");
+    assert_eq!(kids[0].pid, root);
+
+    store.snippet_rename(child, "greeting").unwrap();
+    assert_eq!(store.snippet_list(root).unwrap()[0].name, "greeting");
+
+    let other = store.snippet_add_folder(0, "Other").unwrap();
+    store.snippet_move(child, other).unwrap();
+    assert_eq!(store.snippet_list(root).unwrap().len(), 0);
+    assert_eq!(store.snippet_list(other).unwrap().len(), 1);
+
+    store.snippet_delete(child).unwrap();
+    assert_eq!(store.snippet_list(other).unwrap().len(), 0);
+
+    let nested = store.snippet_add_folder(root, "Nested").unwrap();
+    store.snippet_add(nested, "nested text", "hello").unwrap();
+    assert!(store.snippet_move(root, nested).is_err());
+    store.snippet_delete(root).unwrap();
+    assert!(store.snippet_list(nested).unwrap().is_empty());
+
+    // survives reopen (schema + data persisted in attached file)
+    drop(store);
+    let s2 = Store::open(&p, StoreOpts::default()).unwrap();
+    s2.attach_snippets(&sdb).unwrap();
+    assert_eq!(s2.snippet_list(0).unwrap().len(), 1); // other
 }
 
 #[test]

@@ -1,0 +1,10 @@
+[package]
+name = "clip-line-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clip-line-core = { path = "../clip-line-core" }
