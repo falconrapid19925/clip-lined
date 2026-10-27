@@ -27,6 +27,10 @@ fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
     (Store::open(&p, StoreOpts::default()).unwrap(), p)
 }
 
+fn count(store: &Store) -> usize {
+    store.list(&Filter { limit: 1000, ..Default::default() }).unwrap().len()
+}
+
 #[test]
 fn append_load_roundtrip() {
     let (store, _p) = temp_store("roundtrip");
@@ -125,7 +129,83 @@ fn star_search_delete() {
     assert_eq!(store.list(&f).unwrap().len(), 1);
 
     store.delete(&[a as i64]).unwrap();
-    assert_eq!(store.list(&Filter::default()).unwrap().len(), 1);
+    assert_eq!(count(&store), 1);
+}
+
+#[test]
+fn set_tags_comma_wrapped() {
+    let (store, _p) = temp_store("tags");
+    let a = store.append(&text_event("tagged")).unwrap() as i64;
+    store.set_tags(a, &["Important".into(), "Work".into()]).unwrap();
+    assert_eq!(
+        store.list(&Filter::default()).unwrap()[0].tags,
+        ",Important,Work,"
+    );
+    store.set_tags(a, &[]).unwrap();
+    assert_eq!(store.list(&Filter::default()).unwrap()[0].tags, ",");
+}
+
+#[test]
+fn delete_range_inclusive() {
+    let (store, p) = temp_store("range");
+    for t in ["alpha", "beta"] {
+        store.append(&text_event(t)).unwrap();
+    }
+    // rewrite created to fixed stamps: 2 old (Oct 20-21), 1 new (Oct 27)
+    let conn = rusqlite::Connection::open(&p).unwrap();
+    conn.execute_batch(
+        "UPDATE log SET created='2026-10-20 10:00:00' WHERE id=1;
+         UPDATE log SET created='2026-10-21 10:00:00' WHERE id=2;",
+    )
+    .unwrap();
+    drop(conn);
+    store.append(&text_event("fresh")).unwrap(); // created = now (2026-10-27)
+
+    // window strictly between stamps: boundary rows at both ends survive? no — inclusive:
+    store.delete_range("2026-10-20 10:00:00", "2026-10-21 10:00:00").unwrap();
+    assert_eq!(count(&store), 1, "boundary rows deleted, fresh survives");
+
+    // wide range that clearly covers all rows
+    store.delete_range("2000-01-01 00:00:00", "2100-01-01 00:00:00").unwrap();
+    assert_eq!(count(&store), 0);
+}
+
+#[test]
+fn filter_date_bounds() {
+    let (store, p) = temp_store("filter-dates");
+    store.append(&text_event("old")).unwrap();
+    let created: String = {
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.query_row("SELECT created FROM log WHERE id=1", [], |r| r.get(0))
+            .unwrap()
+    };
+    // to = day before created → excluded
+    let day = &created[..10];
+    let mut prev = day.to_string();
+    prev.replace_range(8..10, "01"); // same month, earlier day
+    assert_eq!(
+        store
+            .list(&Filter {
+                to: Some(prev),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // range covering today → included
+    assert_eq!(
+        store
+            .list(&Filter {
+                from: Some("2000-01-01".into()),
+                to: Some("2100-01-01".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -145,7 +225,50 @@ fn import_legacy_preserves_rows() {
     let (store, _p) = temp_store("import");
     let n = store.import_legacy(&legacy).unwrap();
     assert_eq!(n, 2);
-    assert_eq!(store.list(&Filter::default()).unwrap().len(), 2);
+    assert_eq!(count(&store), 2);
+}
+
+#[test]
+fn snippets_tree_ops() {
+    let (store, p) = temp_store("snippets");
+    let sdb = p.parent().unwrap().join("snippets.sdb");
+
+    // ops before attach must fail
+    assert!(store.snippet_list(0).is_err());
+
+    store.attach_snippets(&sdb).unwrap();
+    assert!(store.attach_snippets(&sdb).is_err(), "second attach errors");
+
+    let root = store.snippet_add(0, "Canned replies", "").unwrap();
+    let child = store.snippet_add(root, "greet", "Hello there!").unwrap();
+
+    let roots = store.snippet_list(0).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].id, root);
+    assert_eq!(roots[0].kind, 2);
+
+    let kids = store.snippet_list(root).unwrap();
+    assert_eq!(kids.len(), 1);
+    assert_eq!(kids[0].id, child);
+    assert_eq!(kids[0].data, "Hello there!");
+    assert_eq!(kids[0].pid, root);
+
+    store.snippet_rename(child, "greeting").unwrap();
+    assert_eq!(store.snippet_list(root).unwrap()[0].name, "greeting");
+
+    let other = store.snippet_add(0, "Other", "").unwrap();
+    store.snippet_move(child, other).unwrap();
+    assert_eq!(store.snippet_list(root).unwrap().len(), 0);
+    assert_eq!(store.snippet_list(other).unwrap().len(), 1);
+
+    store.snippet_delete(child).unwrap();
+    assert_eq!(store.snippet_list(other).unwrap().len(), 0);
+
+    // survives reopen (schema + data persisted in attached file)
+    drop(store);
+    let s2 = Store::open(&p, StoreOpts::default()).unwrap();
+    s2.attach_snippets(&sdb).unwrap();
+    assert_eq!(s2.snippet_list(0).unwrap().len(), 2); // root + other
 }
 
 #[test]
