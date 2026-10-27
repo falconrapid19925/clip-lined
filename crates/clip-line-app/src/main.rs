@@ -254,6 +254,71 @@ fn db_path(cfg_storage: Option<&Path>) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Exit-worthy single-instance check (SPEC cross-cutting). Windows: named
+/// mutex, ERROR_ALREADY_EXISTS means a copy is running. Unix: O_EXCL lockfile.
+/// ponytail: stale-lock cleanup after a crash needs PID liveness checking.
+fn single_instance_guard() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::PCWSTR;
+        let name: Vec<u16> = "Local\\clipLine-single-instance\0".encode_utf16().collect();
+        unsafe {
+            let _ = CreateMutexW(None, false, PCWSTR(name.as_ptr()));
+            if windows::Win32::Foundation::GetLastError() == ERROR_ALREADY_EXISTS {
+                anyhow::bail!("clipLine is already running");
+            }
+        }
+        // Hold the handle for the process lifetime (leak is intentional).
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::OpenOptions;
+        let lock = config_dir()
+            .ok_or_else(|| anyhow::anyhow!("no config dir"))?
+            .join("clipline.lock");
+        match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => {} // hold for process lifetime
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!("clipLine is already running (lockfile {})", lock.display());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Replace (or insert) `[hotkeys] show = "…"` in the TOML text.
+/// Minimal line-based edit: the file is ours, tiny and stable-shaped.
+fn set_toml_show_hotkey(text: &str, hotkey: &str) -> anyhow::Result<String> {
+    let line = format!("show = \"{hotkey}\"");
+    let mut out = String::new();
+    let mut replaced = false;
+    let mut in_hotkeys = false;
+    for l in text.lines() {
+        let trimmed = l.trim_start();
+        if trimmed.starts_with('[') {
+            in_hotkeys = trimmed.starts_with("[hotkeys]");
+        }
+        if in_hotkeys && trimmed.starts_with("show") && trimmed.contains('=') {
+            out.push_str(&line);
+            replaced = true;
+        } else {
+            out.push_str(l);
+        }
+        out.push('\n');
+    }
+    if !replaced {
+        if !out.contains("[hotkeys]") {
+            out.push_str("[hotkeys]\n");
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut import_ini = None;
@@ -267,6 +332,7 @@ fn main() -> anyhow::Result<()> {
         if hks.is_empty() {
             println!("no hotkeys imported from {}", ini.display());
         }
+        let mut best: Option<(u32, String)> = None; // lowest verified slot
         for hk in hks {
             // spec "Open": verify the modifier/key bitfield decodes back cleanly
             let ok = parse_hotkey(&hk.display)
@@ -280,9 +346,34 @@ fn main() -> anyhow::Result<()> {
                 hk.vkey,
                 if ok { "verified" } else { "UNVERIFIED" }
             );
+            if ok && best.as_ref().map(|(s, _)| hk.slot < *s).unwrap_or(true) {
+                best = Some((hk.slot, hk.display.clone()));
+            }
+        }
+        // Merge the first verified slot into clipline.toml [hotkeys] show —
+        // without this the import only printed and discarded the legacy key.
+        if let Some((slot, display)) = best {
+            let cfg_path = default_config_path()?;
+            let text = match std::fs::read_to_string(&cfg_path) {
+                Ok(t) => t,
+                Err(_) => DEFAULT_TOML.to_string(),
+            };
+            match set_toml_show_hotkey(&text, &display) {
+                Ok(new_text) => {
+                    std::fs::write(&cfg_path, new_text)?;
+                    println!("slot {slot}: show hotkey written to {}", cfg_path.display());
+                }
+                Err(e) => println!("could not write {display:?} to config: {e}"),
+            }
+        } else {
+            println!("no verifiable hotkey found; config left unchanged");
         }
         return Ok(());
     }
+
+    // SPEC cross-cutting: single instance. Hand-rolled named mutex on
+    // Windows, O_EXCL lockfile elsewhere (single-instance crate unmaintained).
+    single_instance_guard()?;
 
     let cfg_path = default_config_path()?;
     let (cfg, extras) = load_config(&cfg_path)?;
@@ -307,7 +398,11 @@ fn main() -> anyhow::Result<()> {
     // phase-3 non-Windows adapters.
 
     let suppress: SuppressSlot = Arc::new(Mutex::new(None));
-    spawn_capture(store.clone(), suppress.clone())?;
+    let (capture_tx, capture_rx) = std::sync::mpsc::channel::<String>();
+    spawn_capture(store.clone(), suppress.clone(), capture_tx)?;
+    // Capture-disabled messages land in the footer once; drained in logic().
+    // Shared with the update-check channel pattern (Q11).
+    CAPTURE_RX.set(Mutex::new(capture_rx)).ok();
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -318,7 +413,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "clipLine",
         opts,
-        Box::new(move |cc| {
+        Box::new(move |_cc| {
             let mut app = App::new(store, &cfg, suppress);
             if extras.update.check_on_start {
                 let tx = app.update_tx();
@@ -326,20 +421,8 @@ fn main() -> anyhow::Result<()> {
             }
             // Both want the main thread (macOS tray rule); eframe's creator runs there.
             app.register_show_hotkey(&extras.hotkeys.show);
-            // Hotkey/tray events arrive on background threads → poke egui so the
-            // update loop drains the channels immediately, not at the next 1 Hz tick.
-            global_hotkey::GlobalHotKeyEvent::set_event_handler(Some({
-                let ctx = cc.egui_ctx.clone();
-                move |_| ctx.request_repaint()
-            }));
             #[cfg(windows)]
-            {
-                let ctx = cc.egui_ctx.clone();
-                tray_icon::menu::MenuEvent::set_event_handler(Some(move |_| ctx.request_repaint()));
-                let ctx = cc.egui_ctx.clone();
-                tray_icon::TrayIconEvent::set_event_handler(Some(move |_| ctx.request_repaint()));
-                app.init_tray();
-            }
+            app.init_tray();
             Ok(Box::new(app))
         }),
     )
@@ -387,15 +470,24 @@ fn set_autostart(enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Receiver end of the capture-status channel; taken once in main().
+/// SPEC capture: Err only on fatal listener loss — surface it in the GUI.
+static CAPTURE_RX: std::sync::OnceLock<Mutex<std::sync::mpsc::Receiver<String>>> =
+    std::sync::OnceLock::new();
+
 #[cfg(windows)]
-fn spawn_capture(store: Arc<Store>, suppress: SuppressSlot) -> anyhow::Result<()> {
+fn spawn_capture(
+    store: Arc<Store>,
+    suppress: SuppressSlot,
+    status_tx: std::sync::mpsc::Sender<String>,
+) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
             let mut cap = match clip_line_win::WinCapture::new() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("capture disabled: {e}");
+                    let _ = status_tx.send(format!("capture disabled: {e}"));
                     return;
                 }
             };
@@ -425,8 +517,11 @@ fn spawn_capture(store: Arc<Store>, suppress: SuppressSlot) -> anyhow::Result<()
                         }
                     }
                     Err(e) => {
-                        eprintln!("capture error: {e}");
-                        std::thread::sleep(Duration::from_secs(1));
+                        // Fatal listener loss (message loop ended): stop; the
+                        // GUI footer carries the reason. Retrying a dead
+                        // listener just spams stderr forever.
+                        let _ = status_tx.send(format!("capture disabled: {e}"));
+                        break;
                     }
                 }
             }
@@ -437,7 +532,11 @@ fn spawn_capture(store: Arc<Store>, suppress: SuppressSlot) -> anyhow::Result<()
 }
 
 #[cfg(not(windows))]
-fn spawn_capture(_store: Arc<Store>, _suppress: SuppressSlot) {
+fn spawn_capture(
+    _store: Arc<Store>,
+    _suppress: SuppressSlot,
+    _status_tx: std::sync::mpsc::Sender<String>,
+) {
     // ponytail: x11/wayland/macos adapters land in phase 3
 }
 
@@ -540,6 +639,16 @@ impl App {
     fn poll_update(&mut self) {
         if let Ok(m) = self.update_rx.try_recv() {
             self.update = Some(m);
+        }
+    }
+
+    /// One-shot capture-failure message from the capture thread (SPEC capture:
+    /// "capture off must say why") into the status bar.
+    fn poll_capture_status(&mut self) {
+        if let Some(rx) = CAPTURE_RX.get() {
+            if let Ok(m) = rx.lock().unwrap().try_recv() {
+                self.status = m;
+            }
         }
     }
 
@@ -809,7 +918,12 @@ impl App {
                     hide_soon(ctx.clone(), self.hide_after_ms);
                 }
             }
-            Err(e) => self.status = format!("paste: {e}"),
+            Err(e) => {
+                // Disarm suppression: the clipboard write may have failed, and
+                // an armed slot would swallow the next identical foreign copy.
+                *self.suppress.lock().unwrap() = None;
+                self.status = format!("paste: {e}");
+            }
         }
     }
 
@@ -1015,6 +1129,7 @@ impl eframe::App for App {
     /// Runs even while the window is hidden (0.37 trait) — keeps history fresh.
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_update();
+        self.poll_capture_status();
         self.refresh_if_needed();
         self.handle_global_events(ctx);
         self.handle_keys(ctx);
