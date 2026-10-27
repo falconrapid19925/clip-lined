@@ -1,0 +1,46 @@
+name: Windows preview release
+
+on:
+  push:
+    branches: [preview/clipboard-parity]
+
+permissions:
+  contents: write
+
+jobs:
+  publish-preview:
+    if: github.event.head_commit.message == 'Build Windows preview release'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Windows executable
+        run: cargo build --locked --release -p clip-line-app --bin clip-line-app
+      - name: Package preview
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path preview-package | Out-Null
+          Copy-Item target/release/clip-line-app.exe preview-package/
+          Copy-Item README.md preview-package/
+          Copy-Item LICENSE preview-package/
+          @'
+          clipLine Windows preview
+
+          Extract the ZIP and run clip-line-app.exe. Copy non-sensitive text
+          to try clipboard history. Right-click an entry and choose Copy only,
+          then paste in another app. For automatic paste, hide clipLine with
+          Ctrl+Shift+Up, focus a text editor, press the hotkey again, and
+          select an entry. Quit from the tray menu.
+
+          This is an experimental, unsigned build. Clipboard history is stored
+          unencrypted under %APPDATA%\clip-line. Do not copy passwords while
+          testing. ClipDiary compatibility and Windows desktop behavior require
+          further testing. See README.md for limitations.
+          '@ | Set-Content preview-package/START-HERE.txt
+          Compress-Archive -Path preview-package/* -DestinationPath clipLine-Windows-x64-preview.zip
+      - name: Publish prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.1.0-preview-20261027 clipLine-Windows-x64-preview.zip --target $env:GITHUB_SHA --prerelease --title "clipLine Windows preview" --notes "Experimental Windows x64 preview. Clipboard history is stored unencrypted. Windows desktop and ClipDiary interoperability testing remain outstanding."
