@@ -54,8 +54,17 @@ fn set_clipboard(blocks: &[Block]) -> anyhow::Result<()> {
         anyhow::bail!("no blocks to paste");
     }
     unsafe {
-        if OpenClipboard(None).is_err() {
-            anyhow::bail!("OpenClipboard failed");
+        // The clipboard is routinely held by other processes (target apps,
+        // clipboard managers); retry briefly instead of failing the paste.
+        let opened = (0..20).any(|_| match OpenClipboard(None) {
+            Ok(()) => true,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                false
+            }
+        });
+        if !opened {
+            anyhow::bail!("OpenClipboard failed after retries (held by another app)");
         }
         let result = (|| -> anyhow::Result<()> {
             EmptyClipboard()?;

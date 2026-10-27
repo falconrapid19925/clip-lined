@@ -73,8 +73,10 @@ pub fn map_block(uti: &str, bytes: Vec<u8>) -> Block {
         "public.utf8-plain-text" | "NSStringPboardType" => Format::UnicodeText,
         // Images ride the DIB id (8) so the store sees an image row; the name
         // keeps the real encoding for the paster to restore.
-        "public.tiff" => Format::Registered(8, "TIFF".into()),
-        "public.png" => Format::Registered(8, "PNG".into()),
+        // envelope id must NOT be 8 (CF_DIB byte layout): keep a distinct
+        // registered id so the store never mistakes PNG/TIFF bytes for a DIB.
+        "public.tiff" => Format::Registered(2, "TIFF".into()),
+        "public.png" => Format::Registered(2, "PNG".into()),
         "public.file-url" => Format::FileDrop,
         other => Format::Registered(0, other.to_string()),
     };

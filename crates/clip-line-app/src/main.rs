@@ -2,6 +2,8 @@
 //! Main window + hide-after-paste + global hotkey toggle + tray (Windows).
 //! TODO(spec ui, phase 2 rest): caret-positioned popup viewport.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use clip_line_core::config::Config;
 use clip_line_core::paste::{ClipData, PasteMode};
 use clip_line_core::store::{ClipRow, Filter, Snippet, Store, StoreOpts};
@@ -632,6 +634,8 @@ struct App {
     suppress: SuppressSlot,
     mode: PasteMode,
     hide_after_ms: u64,
+    /// Bumped on every show; pending hide timers check it before hiding.
+    show_gen: Arc<AtomicU64>,
     tab: Tab,
     query: String,
     search_focus: bool,
@@ -669,6 +673,7 @@ impl App {
         App {
             mode: parse_mode(&cfg.paste.default_mode),
             hide_after_ms: cfg.ui.hide_after_ms,
+            show_gen: Arc::new(AtomicU64::new(0)),
             store,
             suppress,
             tab: Tab::History,
@@ -877,6 +882,8 @@ impl App {
     fn select_search(&mut self) {
         self.search_focus = false;
         self.select_after_show = true;
+        // a fresh show cancels any pending hide timer
+        self.show_gen.fetch_add(1, Ordering::SeqCst);
     }
 
     fn refresh_if_needed(&mut self) {
@@ -1001,7 +1008,12 @@ impl App {
         match self.do_paste(id, mode, plain) {
             Ok(()) => {
                 if mode != PasteMode::SetOnly {
-                    hide_soon(ctx.clone(), self.hide_after_ms);
+                    hide_soon(
+                        ctx.clone(),
+                        self.hide_after_ms,
+                        self.show_gen.clone(),
+                        self.show_gen.load(Ordering::SeqCst),
+                    );
                 }
             }
             Err(e) => {
@@ -1195,12 +1207,15 @@ impl App {
 
 /// Sleep `ms` then hide the main window (pasting keeps the target window's
 /// focus this way). The `Context` clone is safe for cross-thread use.
-fn hide_soon(ctx: Context, ms: u64) {
+fn hide_soon(ctx: Context, ms: u64, gen_slot: Arc<AtomicU64>, my_gen: u64) {
     std::thread::Builder::new()
         .name("hide-timer".into())
         .spawn(move || {
             std::thread::sleep(Duration::from_millis(ms));
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            // A newer show (gen bumped) cancels this stale hide.
+            if gen_slot.load(Ordering::SeqCst) == my_gen {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
         })
         .ok();
 }

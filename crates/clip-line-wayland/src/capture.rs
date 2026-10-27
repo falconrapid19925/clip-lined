@@ -109,7 +109,9 @@ fn read_offer(mimes: &[String], offer: &mut Offer<'_>) -> anyhow::Result<Option<
     let mut bytes = Vec::new();
     pipe.read_to_end(&mut bytes)?;
     let format = match mime.as_str() {
-        "image/png" => Format::Registered(0, "image/png".into()),
+        // id must not collide with 8 (CF_DIB) or 15 (CF_HDROP): PNG bytes
+        // are not DIBs; keep a distinct registered id with the mime name.
+        "image/png" => Format::Registered(2, "image/png".into()),
         "text/uri-list" => Format::FileDrop,
         _ => Format::UnicodeText,
     };

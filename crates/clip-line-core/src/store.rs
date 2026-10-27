@@ -145,6 +145,12 @@ fn setup_fts(conn: &Connection) -> anyhow::Result<()> {
 
 /// MATCH if q parses as FTS5 syntax, else LIKE (percent wildcards, bare punctuation).
 fn match_clause(conn: &Connection, q: &str) -> anyhow::Result<&'static str> {
+    // FTS5 MATCH is word-token; SPEC parity search is substring LIKE %q%.
+    // Use MATCH only for plain words (no wildcards) and LIKE for everything
+    // the user means as a substring ("hello worl" must still find rows).
+    if q.contains(['%', '_', '*', '"', '\'']) {
+        return Ok(LIKE_CLAUSE);
+    }
     // ponytail: any probe error falls back to LIKE — only failure mode is bad FTS5 syntax
     Ok(
         if conn
@@ -468,13 +474,14 @@ impl Store {
             );
         }
         let before: i64 = conn.query_row("SELECT count(*) FROM log", [], |r| r.get(0))?;
-        conn.execute_batch(
+        let copy = conn.execute_batch(
             "INSERT OR IGNORE INTO log SELECT * FROM src.log;
              INSERT OR IGNORE INTO options SELECT * FROM src.options;",
-        )?;
-        let after: i64 = conn.query_row("SELECT count(*) FROM log", [], |r| r.get(0))?;
-        conn.execute_batch("DETACH DATABASE src;")?;
-        Ok((after - before) as u64)
+        );
+        let after: Result<i64, _> = conn.query_row("SELECT count(*) FROM log", [], |r| r.get(0));
+        let _ = conn.execute_batch("DETACH DATABASE src;"); // never leak the attach
+        copy?;
+        Ok((after? - before) as u64)
     }
 
     fn last_payload(&self) -> anyhow::Result<Option<Vec<u8>>> {
