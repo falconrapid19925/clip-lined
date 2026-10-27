@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-encryption = ["rusqlite/bundled-sqlcipher"]
+encryption = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 anyhow.workspace = true
