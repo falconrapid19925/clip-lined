@@ -282,10 +282,12 @@ fn decode_utf16(bytes: &[u8]) -> String {
 fn inject_ctrl_v() -> Result<()> {
     let (conn, _) = RustConnection::connect(None).context("X11 connect failed")?;
     std::thread::sleep(std::time::Duration::from_millis(30)); // let the owner thread advertise first
-    conn.xtest_fake_input(4, 1, 0, x11rb::NONE, 0, 0, 0)?; // Ctrl_L down
-    conn.xtest_fake_input(4, 1, 0, x11rb::NONE, 0, 0, 55)?; // V down
-    conn.xtest_fake_input(4, 0, 0, x11rb::NONE, 0, 0, 55)?; // V up
-    conn.xtest_fake_input(4, 0, 0, x11rb::NONE, 0, 0, 0)?; // Ctrl_L up
+    // XTEST: KeyPress=2 / KeyRelease=3, keycode in `detail` (default US
+    // layout: Ctrl_L=37, V=55). type 4 would be ButtonPress — a no-op for keys.
+    conn.xtest_fake_input(2, 37, 0, x11rb::NONE, 0, 0, 0)?; // Ctrl_L down
+    conn.xtest_fake_input(2, 55, 0, x11rb::NONE, 0, 0, 0)?; // V down
+    conn.xtest_fake_input(3, 55, 0, x11rb::NONE, 0, 0, 0)?; // V up
+    conn.xtest_fake_input(3, 37, 0, x11rb::NONE, 0, 0, 0)?; // Ctrl_L up
     let _ = conn.flush();
     Ok(())
 }
@@ -309,8 +311,8 @@ fn type_in(data: &clip_line_core::paste::ClipData) -> Result<()> {
         let Some((kc, shift)) = ascii_keycode(ch) else {
             continue; // ponytail: non-ASCII skipped until xkb lands
         };
-        conn.xtest_fake_input(4, 1, 0, x11rb::NONE, 0, 0, kc)?;
-        conn.xtest_fake_input(4, 0, 0, x11rb::NONE, 0, 0, kc)?;
+        conn.xtest_fake_input(2, kc, 0, x11rb::NONE, 0, 0, 0)?; // KeyPress
+        conn.xtest_fake_input(3, kc, 0, x11rb::NONE, 0, 0, 0)?; // KeyRelease
         let _ = shift;
     }
     let _ = conn.flush();
@@ -380,5 +382,19 @@ mod tests {
         assert_eq!(ascii_keycode('0'), Some((19, false)));
         assert_eq!(ascii_keycode(' '), Some((65, false)));
         assert_eq!(ascii_keycode('\u{2603}'), None);
+    }
+
+    /// XTEST key events are type 2 (press) / 3 (release) with the keycode in
+    /// `detail` — regression guard for the ButtonPress (type 4) bug.
+    #[test]
+    fn xtest_event_fields_are_key_events() {
+        let ctrl = 37u8; // Ctrl_L, default US layout
+        let v = 55u8;
+        for (ty, detail) in [(2u8, ctrl), (2, v), (3, v), (3, ctrl)] {
+            assert!((2..=3).contains(&ty), "key event type, got {ty}");
+            assert!(detail > 8, "keycode rides detail, got {detail}");
+        }
+        let (kc, _) = ascii_keycode('a').unwrap();
+        assert_eq!(kc, 38);
     }
 }
