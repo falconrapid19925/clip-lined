@@ -37,13 +37,17 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir pkg && cp target/release/clip-line-app target/release/clip-line-headless pkg/
+          mkdir pkg
+cp target/release/clip-line-app pkg/
+cp target/release/clip-line-headless pkg/
           tar -czf "${{ matrix.asset }}" -C pkg .
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
-          mkdir pkg && cp target/release/clip-line-app.exe target/release/clip-line-headless.exe pkg/
-          Compress-Archive -Path pkg -DestinationPath "${{ matrix.asset }}"
+          mkdir pkg
+cp target/release/clip-line-app.exe pkg/
+cp target/release/clip-line-headless.exe pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.asset }}
