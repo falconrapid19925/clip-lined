@@ -2,11 +2,27 @@
 
 use clip_line_core::capture::{Block, Format};
 use clip_line_core::paste::{ClipData, PasteMode, Paster};
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+/// GlobalFree is not exposed by the windows 0.62 crate; declare it directly.
+#[allow(non_snake_case)]
+unsafe fn GlobalFree(
+    h: windows::Win32::Foundation::HGLOBAL,
+) -> windows::Win32::Foundation::HGLOBAL {
+    unsafe {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalFree(
+                hmem: windows::Win32::Foundation::HGLOBAL,
+            ) -> windows::Win32::Foundation::HGLOBAL;
+        }
+        GlobalFree(h)
+    }
+}
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
     VK_CONTROL, VK_V,
@@ -45,12 +61,14 @@ fn set_clipboard(blocks: &[Block]) -> anyhow::Result<()> {
         let p = GlobalLock(h);
         if p.is_null() {
             let _ = CloseClipboard();
+            let _ = GlobalFree(h);
             anyhow::bail!("GlobalLock failed");
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
         let _ = GlobalUnlock(h);
         if SetClipboardData(CF_UNICODETEXT_U32, Some(HANDLE(h.0))).is_err() {
             let _ = CloseClipboard();
+            let _ = GlobalFree(h); // system did not take ownership on failure
             anyhow::bail!("SetClipboardData failed");
         }
         let _ = CloseClipboard();
@@ -90,13 +108,13 @@ fn inject_ctrl_v() -> anyhow::Result<()> {
         down(VK_CONTROL, true),
     ];
     std::thread::sleep(std::time::Duration::from_millis(30));
-    unsafe {
-        SendInput(&seq, std::mem::size_of::<INPUT>() as i32);
+    let n = unsafe { SendInput(&seq, std::mem::size_of::<INPUT>() as i32) };
+    if n != seq.len() as u32 {
+        anyhow::bail!(
+            "SendInput blocked (UIPI?): {} of {} events delivered",
+            n,
+            seq.len()
+        );
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn unused_hglobal() -> HGLOBAL {
-    HGLOBAL::default()
 }

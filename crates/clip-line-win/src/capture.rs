@@ -4,14 +4,18 @@ use clip_line_core::capture::{Block, Capture, ClipEvent, Format};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardFormatNameW, OpenClipboard,
+    GetClipboardFormatNameW, OpenClipboard, RemoveClipboardFormatListener,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
 };
 use windows::core::PCWSTR;
+
+/// Clipboard formats backed by global memory (HGLOBAL); everything else
+/// (GDI/metafile handles) is skipped.
+const HGLOBAL_FORMATS: &[u32] = &[1, 7, 8, 13, 15, 16, 17];
 
 pub struct WinCapture {
     hwnd: isize,
@@ -42,10 +46,23 @@ impl WinCapture {
                 None,
                 None,
             )?;
-            AddClipboardFormatListener(hwnd)?;
+            if let Err(e) = AddClipboardFormatListener(hwnd) {
+                let _ = DestroyWindow(hwnd);
+                return Err(e.into());
+            }
             Ok(WinCapture {
                 hwnd: hwnd.0 as isize,
             })
+        }
+    }
+}
+
+impl Drop for WinCapture {
+    fn drop(&mut self) {
+        unsafe {
+            let hwnd = HWND(self.hwnd as *mut _);
+            let _ = RemoveClipboardFormatListener(hwnd);
+            let _ = DestroyWindow(hwnd);
         }
     }
 }
@@ -100,13 +117,22 @@ unsafe fn read_clipboard() -> anyhow::Result<ClipEvent> {
     }
 }
 
+/// True when the format's data is an HGLOBAL we can GlobalLock.
+fn is_hglobal_format(fmt: u32) -> bool {
+    HGLOBAL_FORMATS.contains(&fmt) || fmt >= 0xC000 // registered formats
+}
+
 unsafe fn read_format(fmt: u32) -> Option<Block> {
     unsafe {
         let format = match fmt {
             13 => Format::UnicodeText,
-            8 | 17 => Format::ImageDib, // CF_DIB | CF_DIBV5
+            8 => Format::ImageDib,
+            17 => Format::ImageDibV5, // ponytail: distinct id; V5 header differs from BITMAPINFOHEADER
             15 => Format::FileDrop,
             other => {
+                if !is_hglobal_format(other) {
+                    return None; // GDI/metafile handles: not global memory
+                }
                 let mut name = [0u16; 128];
                 let n = GetClipboardFormatNameW(other, &mut name);
                 if n == 0 {
@@ -116,13 +142,27 @@ unsafe fn read_format(fmt: u32) -> Option<Block> {
                 Format::Registered(other, s)
             }
         };
-        let handle: HANDLE = GetClipboardData(fmt).ok()?; // ponytail: delayed-render sources can fail here; skip not crash
+        let handle: HANDLE = GetClipboardData(fmt).ok()?; // delayed-render sources can fail here; skip not crash
         let h = HGLOBAL(handle.0);
         let p = GlobalLock(h);
         if p.is_null() {
             return None;
         }
-        let len = GlobalSize(h);
+        let alloc = GlobalSize(h);
+        // Producers can over-allocate: for NUL-terminated formats stop at the
+        // first wide NUL pair instead of copying the whole allocation.
+        let len = match format {
+            Format::UnicodeText => {
+                let units = std::slice::from_raw_parts(p as *const u16, alloc / 2);
+                let n = units
+                    .iter()
+                    .position(|&u| u == 0)
+                    .map(|i| (i + 1) * 2)
+                    .unwrap_or(alloc);
+                n.min(alloc)
+            }
+            _ => alloc,
+        };
         let bytes = std::slice::from_raw_parts(p as *const u8, len).to_vec();
         let _ = GlobalUnlock(h);
         Some(Block { format, bytes })

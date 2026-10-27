@@ -19,8 +19,10 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Format {
     UnicodeText,
-    /// Device-independent bitmap, optionally with a PNG twin block.
+    /// Device-independent bitmap (BITMAPINFOHEADER), optionally with a PNG twin block.
     ImageDib,
+    /// DIB with BITMAPV5HEADER (CF_DIBV5) — distinct from ImageDib: header layout differs.
+    ImageDibV5,
     FileDrop,
     Registered(u32, String),
 }
@@ -33,6 +35,7 @@ impl Format {
         match self {
             Format::UnicodeText => 13, // CF_UNICODETEXT
             Format::ImageDib => 8,     // CF_DIB
+            Format::ImageDibV5 => 17,  // CF_DIBV5
             Format::FileDrop => 15,    // CF_HDROP
             Format::Registered(id, _) => *id,
         }
@@ -42,6 +45,7 @@ impl Format {
         match id {
             13 => Format::UnicodeText,
             8 => Format::ImageDib,
+            17 => Format::ImageDibV5,
             15 => Format::FileDrop,
             other => Format::Registered(other, name.unwrap_or_default().to_string()),
         }

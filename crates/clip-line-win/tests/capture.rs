@@ -19,6 +19,20 @@ fn listener_starts_and_reads_one_clipboard_change() {
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::DataExchange::*;
             use windows::Win32::System::Memory::*;
+            #[allow(non_snake_case)]
+            unsafe fn GlobalFree(
+                h: windows::Win32::Foundation::HGLOBAL,
+            ) -> windows::Win32::Foundation::HGLOBAL {
+                unsafe {
+                    #[link(name = "kernel32")]
+                    unsafe extern "system" {
+                        fn GlobalFree(
+                            hmem: windows::Win32::Foundation::HGLOBAL,
+                        ) -> windows::Win32::Foundation::HGLOBAL;
+                    }
+                    GlobalFree(h)
+                }
+            }
             if OpenClipboard(None).is_err() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
@@ -29,14 +43,13 @@ fn listener_starts_and_reads_one_clipboard_change() {
             assert!(!p.is_null());
             std::ptr::copy_nonoverlapping(units.as_ptr(), p as *mut u8, units.len());
             let _ = GlobalUnlock(h);
-            // SetClipboardData returns null HGLOBAL when the system takes a copy;
-            // windows 0.62 models null as Err(HRESULT 0) — treat both as ok.
             let r = SetClipboardData(13, Some(HANDLE(h.0)));
             let _ = CloseClipboard();
-            if r.is_ok() || r.unwrap_err().code().0 == 0 {
+            if r.is_ok() {
                 set = true;
                 break;
             }
+            let _ = GlobalFree(h);
         }
     }
     assert!(set, "could not set clipboard text after retries");

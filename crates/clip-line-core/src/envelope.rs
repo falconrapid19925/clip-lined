@@ -27,6 +27,9 @@ pub fn unpack(bytes: &[u8]) -> anyhow::Result<Vec<Block>> {
     let mut gz = GzDecoder::new(bytes);
     let mut inner = Vec::new();
     gz.read_to_end(&mut inner).context("gzip decode")?;
+    if inner.is_empty() {
+        bail!("empty envelope payload");
+    }
     let mut blocks = Vec::new();
     let mut p = 0usize;
     while p + 12 <= inner.len() {
@@ -44,6 +47,9 @@ pub fn unpack(bytes: &[u8]) -> anyhow::Result<Vec<Block>> {
             bytes: inner[p + 12..end].to_vec(),
         });
         p = end;
+    }
+    if p != inner.len() {
+        bail!("{} trailing bytes after last block", inner.len() - p);
     }
     Ok(blocks)
 }

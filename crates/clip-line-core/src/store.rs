@@ -100,7 +100,11 @@ impl Store {
     }
 
     /// Stores an event. Deduplicates against the last row's payload.
+    /// Empty events (clipboard open failure, no recognized formats) are skipped.
     pub fn append(&self, ev: &ClipEvent) -> anyhow::Result<u64> {
+        if ev.blocks.is_empty() {
+            return Ok(0);
+        }
         let payload = envelope::pack(&ev.blocks)?;
         if let Some(last) = self.last_payload()? {
             if last == payload {
@@ -238,13 +242,17 @@ fn text_of(blocks: &[Block]) -> String {
 }
 
 fn classify(text: &str, blocks: &[Block]) -> (String, String, i64) {
-    if blocks.iter().any(|b| b.format == Format::ImageDib) {
+    if blocks
+        .iter()
+        .any(|b| matches!(b.format, Format::ImageDib | Format::ImageDibV5))
+    {
         return ("Image".into(), String::new(), type_code::IMAGE);
     }
     if blocks.iter().any(|b| b.format == Format::FileDrop) {
         return ("Files".into(), String::new(), type_code::FILES);
     }
     let first_line = text.lines().next().unwrap_or_default().to_string();
+    let text = text.trim();
     let looks_url = text.len() < 2048
         && (text.starts_with("http://") || text.starts_with("https://"))
         && !text.contains(char::is_whitespace);
