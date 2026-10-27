@@ -28,7 +28,13 @@ fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
 }
 
 fn count(store: &Store) -> usize {
-    store.list(&Filter { limit: 1000, ..Default::default() }).unwrap().len()
+    store
+        .list(&Filter {
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap()
+        .len()
 }
 
 #[test]
@@ -136,7 +142,9 @@ fn star_search_delete() {
 fn set_tags_comma_wrapped() {
     let (store, _p) = temp_store("tags");
     let a = store.append(&text_event("tagged")).unwrap() as i64;
-    store.set_tags(a, &["Important".into(), "Work".into()]).unwrap();
+    store
+        .set_tags(a, &["Important".into(), "Work".into()])
+        .unwrap();
     assert_eq!(
         store.list(&Filter::default()).unwrap()[0].tags,
         ",Important,Work,"
@@ -162,11 +170,15 @@ fn delete_range_inclusive() {
     store.append(&text_event("fresh")).unwrap(); // created = now (2026-10-27)
 
     // window strictly between stamps: boundary rows at both ends survive? no — inclusive:
-    store.delete_range("2026-10-20 10:00:00", "2026-10-21 10:00:00").unwrap();
+    store
+        .delete_range("2026-10-20 10:00:00", "2026-10-21 10:00:00")
+        .unwrap();
     assert_eq!(count(&store), 1, "boundary rows deleted, fresh survives");
 
     // wide range that clearly covers all rows
-    store.delete_range("2000-01-01 00:00:00", "2100-01-01 00:00:00").unwrap();
+    store
+        .delete_range("2000-01-01 00:00:00", "2100-01-01 00:00:00")
+        .unwrap();
     assert_eq!(count(&store), 0);
 }
 

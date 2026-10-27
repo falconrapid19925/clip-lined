@@ -82,9 +82,9 @@ fn decode_modifier(bits: u32) -> Option<String> {
 /// Virtual-key name for the printable/common range; None elsewhere (caller falls back).
 fn key_name(vkey: u32) -> Option<String> {
     match vkey {
-        0x30..=0x39 => Some((vkey as u8 as char).to_string()),       // 0-9
-        0x41..=0x5A => Some((vkey as u8 as char).to_string()),       // A-Z
-        0x70..=0x87 => Some(format!("F{}", vkey - 0x6F)),            // F1-F24
+        0x30..=0x39 => Some((vkey as u8 as char).to_string()), // 0-9
+        0x41..=0x5A => Some((vkey as u8 as char).to_string()), // A-Z
+        0x70..=0x87 => Some(format!("F{}", vkey - 0x6F)),      // F1-F24
         _ => None,
     }
 }
@@ -122,12 +122,14 @@ pub fn parse_hotkeys_list(list: &str) -> Vec<LegacyHotkey> {
 
 /// Reads a legacy `clipdiary.cfg` `[Options]` subset. Only hotkeys import today.
 pub fn import_legacy_ini(path: &Path) -> anyhow::Result<Vec<LegacyHotkey>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut list = String::new();
     for l in text.lines() {
         let l = l.trim();
-        if let Some(v) = l.strip_prefix("HotKeysList").and_then(|r| r.strip_prefix('=')) {
+        if let Some(v) = l
+            .strip_prefix("HotKeysList")
+            .and_then(|r| r.strip_prefix('='))
+        {
             list = v.to_string();
         }
     }

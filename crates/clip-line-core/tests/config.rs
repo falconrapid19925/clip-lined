@@ -26,7 +26,10 @@ hide_after_ms = 2000
 "#,
     );
     let c = Config::load(&p).unwrap();
-    assert_eq!(c.storage.path.as_deref(), Some(std::path::Path::new(r"C:\History\diary.db")));
+    assert_eq!(
+        c.storage.path.as_deref(),
+        Some(std::path::Path::new(r"C:\History\diary.db"))
+    );
     assert_eq!(c.paste.default_mode, "inject_ctrl_v");
     assert_eq!(c.ui.hide_after_ms, 2000);
 }
