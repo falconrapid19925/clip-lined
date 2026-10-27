@@ -101,6 +101,64 @@ CREATE TABLE IF NOT EXISTS log(
 CREATE TABLE IF NOT EXISTS options(key CHAR(30) PRIMARY KEY not null default '', value TEXT not null default '');
 ";
 
+/// External-content FTS5 mirror of log(title,appname,url), kept in sync by triggers.
+/// ponytail: MATCH-only via match_clause; if rank/snippet/prefix queries are ever
+/// needed, extend match_clause — callers stay on Filter.query.
+const FTS_SCHEMA: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(title, appname, url, content='log', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS log_fts_ai AFTER INSERT ON log BEGIN
+  INSERT INTO log_fts(rowid,title,appname,url) VALUES(new.id,new.title,new.appname,new.url);
+END;
+CREATE TRIGGER IF NOT EXISTS log_fts_ad AFTER DELETE ON log BEGIN
+  INSERT INTO log_fts(log_fts,rowid,title,appname,url) VALUES('delete',old.id,old.title,old.appname,old.url);
+END;
+CREATE TRIGGER IF NOT EXISTS log_fts_au AFTER UPDATE ON log BEGIN
+  INSERT INTO log_fts(log_fts,rowid,title,appname,url) VALUES('delete',old.id,old.title,old.appname,old.url);
+  INSERT INTO log_fts(rowid,title,appname,url) VALUES(new.id,new.title,new.appname,new.url);
+END;
+";
+
+const FTS_MATCH_CLAUSE: &str =
+    " AND id IN (SELECT rowid FROM log_fts WHERE log_fts MATCH ?1)";
+const LIKE_CLAUSE: &str =
+    " AND (title LIKE '%'||?1||'%' OR appname LIKE '%'||?1||'%' OR url LIKE '%'||?1||'%')";
+
+fn setup_fts(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(FTS_SCHEMA)?;
+    // one-time population of pre-existing rows; options flag makes it idempotent
+    let built: bool = conn
+        .query_row("SELECT value FROM options WHERE key='fts5_built'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !built {
+        conn.execute_batch("INSERT INTO log_fts(log_fts) VALUES('rebuild');")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO options(key,value) VALUES('fts5_built','1')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// MATCH if q parses as FTS5 syntax, else LIKE (percent wildcards, bare punctuation).
+fn match_clause(conn: &Connection, q: &str) -> anyhow::Result<&'static str> {
+    // ponytail: any probe error falls back to LIKE — only failure mode is bad FTS5 syntax
+    Ok(if conn
+        .query_row(
+            "SELECT count(*) FROM log_fts WHERE log_fts MATCH ?1",
+            params![q],
+            |_| Ok(()),
+        )
+        .is_ok()
+    {
+        FTS_MATCH_CLAUSE
+    } else {
+        LIKE_CLAUSE
+    })
+}
+
 const SNIPPETS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS snippets.common(
   id INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER not null default 0,
@@ -116,6 +174,7 @@ impl Store {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
+        setup_fts(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
             snips_attached: AtomicBool::new(false),
@@ -187,8 +246,9 @@ impl Store {
         if let Some(k) = f.kind {
             sql.push_str(&format!(" AND type={k}"));
         }
-        if f.query.is_some() {
-            sql.push_str(" AND (title LIKE '%'||?1||'%' OR appname LIKE '%'||?1||'%' OR url LIKE '%'||?1||'%')");
+        let conn = self.conn.lock().unwrap();
+        if let Some(q) = &f.query {
+            sql.push_str(match_clause(&conn, q)?);
         }
         if f.from.is_some() {
             sql.push_str(" AND created>=?2");
@@ -197,7 +257,6 @@ impl Store {
             sql.push_str(" AND created<=?3");
         }
         sql.push_str(" ORDER BY id DESC LIMIT ?4 OFFSET ?5");
-        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             params![

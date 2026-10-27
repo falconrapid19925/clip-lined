@@ -282,3 +282,71 @@ fn gzip_envelope_shape() {
     let blocks = clip_line_core::envelope::unpack(&bytes).unwrap();
     assert_eq!(blocks[0].bytes, vec![0x41, 0x00]);
 }
+
+#[test]
+fn fts_search_matches_title() {
+    let (store, _p) = temp_store("fts-title");
+    store.append(&text_event("alpha needle here")).unwrap();
+    store.append(&text_event("beta hay there")).unwrap();
+    let rows = store
+        .list(&Filter {
+            query: Some("needle".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].title.contains("needle"));
+}
+
+#[test]
+fn fts_percent_wildcard_falls_back_like() {
+    let (store, _p) = temp_store("fts-like");
+    store.append(&text_event("foobarbaz qux")).unwrap();
+    store.append(&text_event("other")).unwrap();
+    // '%' is invalid FTS5 syntax (unquoted) → LIKE fallback still matches substring
+    let rows = store
+        .list(&Filter {
+            query: Some("%barba%".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].title.contains("foobarbaz"));
+}
+
+#[test]
+fn fts_legacy_db_backfilled_on_open() {
+    // DB with rows but no FTS table (simulates pre-FTS database)
+    let (store, p) = temp_store("fts-legacy");
+    store.append(&text_event("old row searchable")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER log_fts_ai; DROP TRIGGER log_fts_ad; DROP TRIGGER log_fts_au;
+             DROP TABLE log_fts; DELETE FROM options WHERE key='fts5_built';",
+        )
+        .unwrap();
+    }
+    drop(store);
+    // reopen: FTS recreated + pre-existing rows indexed, search works
+    let store = Store::open(&p, StoreOpts::default()).unwrap();
+    let rows = store
+        .list(&Filter {
+            query: Some("searchable".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1, "legacy row found via FTS after backfill");
+}
+
+#[test]
+fn fts_odd_query_no_panic() {
+    let (store, _p) = temp_store("fts-odd");
+    store.append(&text_event("some clip")).unwrap();
+    for q in [
+        "", " ", "%", "_", "(", "\"", "*", "OR", "NEAR(", "\\", "a b -", "ünïcödé",
+    ] {
+        // must not panic; any result count acceptable
+        let _ = store.list(&Filter { query: Some(q.into()), ..Default::default() });
+    }
+}
