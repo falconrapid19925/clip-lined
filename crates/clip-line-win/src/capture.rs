@@ -4,12 +4,18 @@ use clip_line_core::capture::{Block, Capture, ClipEvent, Format};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardFormatNameW, OpenClipboard, RemoveClipboardFormatListener,
+    GetClipboardFormatNameW, GetClipboardSequenceNumber, OpenClipboard,
+    RemoveClipboardFormatListener,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetWindowTextW, GetWindowThreadProcessId, MSG, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLIPBOARDUPDATE,
 };
 use windows::core::PCWSTR;
 
@@ -19,6 +25,15 @@ const HGLOBAL_FORMATS: &[u32] = &[1, 7, 8, 13, 15, 16, 17];
 
 pub struct WinCapture {
     hwnd: isize,
+    /// Sequence number of the last clipboard write we made ourselves;
+    /// events at that number are self-originated and skipped.
+    suppress_seq: Option<u32>,
+}
+
+/// True when a clipboard event with sequence `ev_seq` must be ignored
+/// because it matches a self-originated write (`seen`).
+pub fn should_ignore(seen: Option<u32>, ev_seq: u32) -> bool {
+    seen == Some(ev_seq)
 }
 
 impl WinCapture {
@@ -52,8 +67,15 @@ impl WinCapture {
             }
             Ok(WinCapture {
                 hwnd: hwnd.0 as isize,
+                suppress_seq: None,
             })
         }
+    }
+
+    /// Tell the capture to ignore the event carrying sequence number `seq`
+    /// (the write `WinPaster` just made; see `WinPaster::paste`).
+    pub fn suppress_next(&mut self, seq: u32) {
+        self.suppress_seq = Some(seq);
     }
 }
 
@@ -83,6 +105,10 @@ impl Capture for WinCapture {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
                 if msg.message == WM_CLIPBOARDUPDATE {
+                    if should_ignore(self.suppress_seq, GetClipboardSequenceNumber()) {
+                        self.suppress_seq = None; // one-shot: next write is foreign again
+                        continue;
+                    }
                     return read_clipboard();
                 }
             }
@@ -169,7 +195,65 @@ unsafe fn read_format(fmt: u32) -> Option<Block> {
     }
 }
 
+/// Foreground window's process name (basename, no `.exe`) and window title.
+/// Unknown steps degrade to "" — never block capture on lookup failure.
 unsafe fn foreground_app() -> (String, String) {
-    // ponytail: process-name + window-title lookup lands with paste polish (phase 2)
-    (String::new(), String::new())
+    unsafe {
+        let app = foreground_process_name().unwrap_or_default();
+        let title = foreground_title().unwrap_or_default();
+        (app, title)
+    }
+}
+
+unsafe fn foreground_process_name() -> Option<String> {
+    unsafe {
+        let hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        if r.is_err() {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let base = path.rsplit(['/', '\\']).next().unwrap_or(&path);
+        Some(base.strip_suffix(".exe").unwrap_or(base).to_string())
+    }
+}
+
+unsafe fn foreground_title() -> Option<String> {
+    unsafe {
+        let hwnd = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        if n == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..n as usize]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_ignore;
+
+    #[test]
+    fn suppression_matches_only_the_recorded_sequence() {
+        assert!(should_ignore(Some(42), 42), "self-originated event ignored");
+        assert!(!should_ignore(Some(42), 43), "next foreign event passes");
+        assert!(!should_ignore(None, 42), "no suppression armed: everything passes");
+        assert!(!should_ignore(Some(0), 1), "seq 0 (no clipboard yet) never blocks later events");
+    }
 }
