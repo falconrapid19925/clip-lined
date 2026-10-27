@@ -181,9 +181,26 @@ impl OwnerState {
             .as_deref()
             .and_then(|c| target_data(&c.blocks, req.target, &self.atoms))
         {
+            // X properties carry raw bytes; x11rb change_property* takes u32
+            // words for 32-bit formats but u8 data must go through
+            // change_property8 with format=8. Serve as bytes via
+            // change_property8 regardless of word width: formats here
+            // (UTF8_STRING, ATOM lists, registered blobs) are all 8-bit
+            // properties per ICCCM except ATOM, whose u32 list is byte-packed
+            // identically on little-endian — so pack every payload as bytes.
             Some((ty, data)) => self
                 .conn
-                .change_property32(PropMode::REPLACE, req.requestor, prop, ty, &data)
+                .change_property8(
+                    PropMode::REPLACE,
+                    req.requestor,
+                    prop,
+                    ty,
+                    data.iter()
+                        .map(|w| w.to_le_bytes())
+                        .flatten()
+                        .collect::<Vec<u8>>()
+                        .as_slice(),
+                )
                 .is_ok(),
             None => false,
         };

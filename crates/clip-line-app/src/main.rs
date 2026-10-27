@@ -443,11 +443,10 @@ fn set_autostart(enabled: bool) -> anyhow::Result<()> {
     unsafe {
         if enabled {
             let exe = std::env::current_exe()?;
-            let data: Vec<u16> = exe
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            // Quote: Run entries with spaces in the path are split at the
+            // first space by the shell otherwise.
+            let quoted = format!("\"{}\"", exe.display());
+            let data: Vec<u16> = quoted.encode_utf16().chain(std::iter::once(0)).collect();
             let r = RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 windows::core::PCWSTR(subkey.as_ptr()),
@@ -491,53 +490,135 @@ fn spawn_capture(
                     return;
                 }
             };
-            use clip_line_core::capture::Capture;
-            loop {
-                match cap.next_event() {
-                    Ok(ev) => {
-                        // Our own paste write: payload was armed before the
-                        // clipboard write; skip and clear the slot.
-                        let mine = clip_line_core::envelope::pack(&ev.blocks)
-                            .ok()
-                            .and_then(|p| {
-                                let mut g = suppress.lock().unwrap();
-                                match &*g {
-                                    Some(want) if *want == p => {
-                                        *g = None;
-                                        Some(())
-                                    }
-                                    _ => None,
-                                }
-                            });
-                        if mine.is_some() {
-                            continue;
-                        }
-                        if let Err(e) = store.append(&ev) {
-                            eprintln!("store append: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        // Fatal listener loss (message loop ended): stop; the
-                        // GUI footer carries the reason. Retrying a dead
-                        // listener just spams stderr forever.
-                        let _ = status_tx.send(format!("capture disabled: {e}"));
-                        break;
-                    }
-                }
-            }
+            capture_loop(&mut cap, store, suppress, status_tx);
         })
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("spawn capture: {e}"))?;
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn spawn_capture(
-    _store: Arc<Store>,
-    _suppress: SuppressSlot,
-    _status_tx: std::sync::mpsc::Sender<String>,
+    store: Arc<Store>,
+    suppress: SuppressSlot,
+    status_tx: std::sync::mpsc::Sender<String>,
+) -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("capture".into())
+        .spawn(move || {
+            use clip_line_core::capture::Capture;
+            let mut cap = match clip_line_macos::MacCapture::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = status_tx.send(format!("capture disabled: {e}"));
+                    return;
+                }
+            };
+            capture_loop(&mut cap, store, suppress, status_tx);
+        })
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("spawn capture: {e}"))
+}
+
+/// X11 vs Wayland decided at runtime: WAYLAND_DISPLAY wins, X11 falls back.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_capture(
+    store: Arc<Store>,
+    suppress: SuppressSlot,
+    status_tx: std::sync::mpsc::Sender<String>,
+) -> anyhow::Result<()> {
+    use clip_line_core::capture::Capture;
+    std::thread::Builder::new()
+        .name("capture".into())
+        .spawn(move || {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                #[cfg(feature = "wayland")]
+                match clip_line_wayland::WaylandCapture::new() {
+                    Ok(mut c) => capture_loop(&mut c, store, suppress, status_tx),
+                    Err(e) => {
+                        // story 7: say why, not silence
+                        let _ = status_tx.send(format!("capture disabled: {e}"));
+                    }
+                }
+                #[cfg(not(feature = "wayland"))]
+                let _ = (store, suppress, status_tx); // build lacks wayland support
+            } else {
+                #[cfg(feature = "x11")]
+                match clip_line_x11::X11Capture::new() {
+                    Ok(mut c) => capture_loop(&mut c, store, suppress, status_tx),
+                    Err(e) => {
+                        let _ = status_tx.send(format!("capture disabled: {e}"));
+                    }
+                }
+                #[cfg(not(feature = "x11"))]
+                let _ = (store, suppress, status_tx); // build lacks x11 support
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("spawn capture: {e}"))
+}
+
+#[cfg(windows)]
+fn paste_on_this_os(data: &ClipData, mode: PasteMode) -> anyhow::Result<()> {
+    use clip_line_core::paste::Paster;
+    clip_line_win::WinPaster.paste(data, mode)
+}
+
+#[cfg(target_os = "macos")]
+fn paste_on_this_os(data: &ClipData, mode: PasteMode) -> anyhow::Result<()> {
+    use clip_line_core::paste::Paster;
+    clip_line_macos::MacPaster.paste(data, mode)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn paste_on_this_os(data: &ClipData, mode: PasteMode) -> anyhow::Result<()> {
+    use clip_line_core::paste::Paster;
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        clip_line_wayland::WaylandPaster.paste(data, mode)
+    } else {
+        // X11Paster owns the selection; cheap to build per paste.
+        use clip_line_core::paste::Paster;
+        clip_line_x11::X11Paster::new()?.paste(data, mode)
+    }
+}
+
+/// Shared drain loop: skip self-writes, persist foreign events, report fatal loss.
+fn capture_loop<C: clip_line_core::capture::Capture>(
+    cap: &mut C,
+    store: Arc<Store>,
+    suppress: SuppressSlot,
+    status_tx: std::sync::mpsc::Sender<String>,
 ) {
-    // ponytail: x11/wayland/macos adapters land in phase 3
+    loop {
+        match cap.next_event() {
+            Ok(ev) => {
+                // Our own paste write: payload was armed before the
+                // clipboard write; skip and clear the slot.
+                let mine = clip_line_core::envelope::pack(&ev.blocks)
+                    .ok()
+                    .and_then(|p| {
+                        let mut g = suppress.lock().unwrap();
+                        match &*g {
+                            Some(want) if *want == p => {
+                                *g = None;
+                                Some(())
+                            }
+                            _ => None,
+                        }
+                    });
+                if mine.is_some() {
+                    continue;
+                }
+                if let Err(e) = store.append(&ev) {
+                    eprintln!("store append: {e}");
+                }
+            }
+            Err(e) => {
+                let _ = status_tx.send(format!("capture disabled: {e}"));
+                break;
+            }
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -848,6 +929,11 @@ impl App {
             }
             return;
         }
+        // any focused widget (date fields etc.) owns the keyboard: typing
+        // 1-9 there must not quick-pick a row, Enter must not paste.
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
         let mut delta = 0isize;
         ctx.input(|i| {
             if i.key_pressed(Key::ArrowDown) {
@@ -936,20 +1022,14 @@ impl App {
             }
         }
         // Arm suppression BEFORE the clipboard write — see SuppressSlot.
+        // Disarm on failure so a stale slot cannot swallow the next foreign copy.
         let payload = clip_line_core::envelope::pack(&blocks)?;
         *self.suppress.lock().unwrap() = Some(payload);
-        #[cfg(windows)]
-        {
-            use clip_line_core::paste::Paster;
-            clip_line_win::WinPaster.paste(&ClipData { blocks }, mode)
+        let r = paste_on_this_os(&ClipData { blocks }, mode);
+        if r.is_err() {
+            *self.suppress.lock().unwrap() = None;
         }
-        #[cfg(not(windows))]
-        {
-            let _ = (mode, blocks);
-            Err(anyhow::anyhow!(
-                "paste adapter not built on this OS (phase 3)"
-            ))
-        }
+        r
     }
 
     fn history_ui(&mut self, ui: &mut egui::Ui) {

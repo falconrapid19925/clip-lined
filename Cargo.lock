@@ -671,7 +671,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clip-line-core",
+ "clip-line-macos",
+ "clip-line-wayland",
  "clip-line-win",
+ "clip-line-x11",
  "eframe",
  "egui_extras",
  "global-hotkey",

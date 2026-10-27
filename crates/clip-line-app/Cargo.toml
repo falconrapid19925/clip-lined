@@ -35,5 +35,17 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
 ] }
 
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+clip-line-x11 = { path = "../clip-line-x11", optional = true }
+clip-line-wayland = { path = "../clip-line-wayland", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+clip-line-macos = { path = "../clip-line-macos" }
+
+[features]
+default = []
+x11 = ["clip-line-x11"]
+wayland = ["clip-line-wayland"]
+
 [dev-dependencies]
 tempfile = "3"
