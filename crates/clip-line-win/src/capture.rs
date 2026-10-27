@@ -109,7 +109,12 @@ impl Capture for WinCapture {
                         self.suppress_seq = None; // one-shot: next write is foreign again
                         continue;
                     }
-                    return read_clipboard();
+                    // EmptyClipboard or foreign formats we can't read leave
+                    // zero blocks — that state carries no clip; keep waiting.
+                    let ev = read_clipboard()?;
+                    if !ev.blocks.is_empty() {
+                        return Ok(ev);
+                    }
                 }
             }
         }
