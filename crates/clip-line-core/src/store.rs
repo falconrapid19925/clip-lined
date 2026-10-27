@@ -497,12 +497,38 @@ fn text_of(blocks: &[Block]) -> String {
     String::new()
 }
 
+/// Registered-format names the adapters emit for image payloads (macOS UTIs,
+/// Wayland MIME types, Windows "PNG"/"JFIF" twins). Name-only matching: the
+/// registered numeric id is machine-local and carries no meaning.
+fn is_registered_image(name: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "PNG",
+        "TIFF",
+        "JFIF",
+        "image/png",
+        "image/tiff",
+        "image/jpeg",
+        "image/bmp",
+        "image/webp",
+        "application/x-qt-image",
+    ];
+    KNOWN.iter().any(|k| name.eq_ignore_ascii_case(k))
+}
+
 fn classify(text: &str, blocks: &[Block]) -> (String, String, i64) {
     if blocks
         .iter()
         .any(|b| matches!(b.format, Format::ImageDib | Format::ImageDibV5))
     {
         return ("Image".into(), String::new(), type_code::IMAGE);
+    }
+    // Registered image formats (type 0 per interop.md: PNG-like screen
+    // captures from non-Windows adapters and PNG twins).
+    if blocks.iter().any(|b| match &b.format {
+        Format::Registered(_, name) => is_registered_image(name),
+        _ => false,
+    }) {
+        return ("Image".into(), String::new(), type_code::REGISTERED_IMAGE);
     }
     if blocks.iter().any(|b| b.format == Format::FileDrop) {
         return ("Files".into(), String::new(), type_code::FILES);

@@ -107,6 +107,35 @@ fn classify_url_text_image() {
 }
 
 #[test]
+fn classify_registered_image() {
+    // macOS/Wayland adapters deliver images as Registered blocks (interop.md
+    // type 0: registered image format). They must classify as images, not text.
+    let (store, _p) = temp_store("classify_reg_img");
+    let mut seen = 0;
+    for (id, name) in [(8u32, "PNG"), (0, "image/png"), (0, "image/tiff")] {
+        seen += 1;
+        let ev = ClipEvent {
+            blocks: vec![Block {
+                format: Format::Registered(id, name.into()),
+                bytes: vec![seen as u8, 2, 3], // distinct payload: append dedups identical envelopes
+            }],
+            source_app: "demo".into(),
+            source_title: String::new(),
+        };
+        let rid = store.append(&ev).unwrap();
+        assert!(rid > 0, "{name} stored");
+        let rows = store
+            .list(&Filter {
+                kind: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), seen, "{name} classified as registered image");
+        assert_eq!(rows[0].title, "Image");
+    }
+}
+
+#[test]
 fn title_truncated_to_55() {
     let (store, _p) = temp_store("title55");
     let long = "x".repeat(200);
