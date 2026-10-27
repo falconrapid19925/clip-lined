@@ -117,14 +117,15 @@ fn apply_key(conn: &Connection, key: &str) -> anyhow::Result<()> {
     if key.is_empty() {
         bail!("StoreOpts.key must not be empty");
     }
-    conn.pragma_update(None, "key", key).context("PRAGMA key")?;
+    // Quote-wrapped string literal (SQLCipher). rusqlite pragma_update helpers
+    // mishandle PRAGMA key on reopen, so build the statement by hand with the
+    // key SQL-escaped (doubling embedded single quotes).
+    let esc = key.replace(char::from(0x27), char::from(0x27).to_string().repeat(2).as_str());
+    conn.execute_batch(&format!("PRAGMA key = '{}';", esc))
+        .context("PRAGMA key")?;
     conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
         .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot open database with key: wrong key, or the database is not \
-                 encrypted. Legacy databases are unlocked: open them without a key. \
-                 Encrypted databases are new DBs only (SPEC Q9): {e}"
-            )
+            anyhow::anyhow!("cannot open database with key: wrong key, or the database is not encrypted. Legacy databases are unlocked: open them without a key. Encrypted databases are new DBs only (SPEC Q9): {e}")
         })?;
     Ok(())
 }
@@ -380,8 +381,15 @@ impl Store {
             "ATTACH DATABASE '{}' AS src;",
             legacy.display().to_string().replace('\'', "''")
         );
-        conn.execute_batch(&attach)
-            .with_context(|| format!("attach {}", legacy.display()))?;
+        if let Err(e) = conn.execute_batch(&attach) {
+            // Attach validates the key at once on SQLCipher builds: an
+            // encrypted (or non-SQLite) source fails here, not at first read.
+            bail!(
+                "cannot import {}: {}. The source is encrypted (or not a SQLite database); clipLine cannot read encrypted sources (SPEC Q9). Import from the unencrypted original",
+                legacy.display(),
+                e
+            );
+        }
         if let Err(e) = conn.query_row("SELECT count(*) FROM src.sqlite_schema", [], |_| Ok(())) {
             let _ = conn.execute_batch("DETACH DATABASE src;");
             bail!(

@@ -61,10 +61,10 @@ fn wrong_key_fails_clearly() {
         let store = Store::open(&p, opts("right")).unwrap();
         store.append(&text_event("data")).unwrap();
     }
-    let err = Store::open(&p, opts("wrong")).unwrap_err().to_string();
+    let err = match Store::open(&p, opts("wrong")) { Err(e) => e.to_string(), Ok(_) => panic!("wrong key must fail") };
     assert!(err.contains("wrong key"), "message should name the cause: {err}");
     // no key on an encrypted db also fails with the clear message
-    let err = Store::open(&p, StoreOpts::default()).unwrap_err().to_string();
+    let err = match Store::open(&p, StoreOpts::default()) { Err(e) => e.to_string(), Ok(_) => panic!("no-key open of encrypted db must fail") };
     assert!(err.contains("key") || err.contains("database"), "{err}");
 }
 
@@ -76,7 +76,7 @@ fn legacy_plaintext_with_key_fails_clearly() {
         let store = Store::open(&p, StoreOpts::default()).unwrap(); // plaintext
         store.append(&text_event("legacy row")).unwrap();
     }
-    let err = Store::open(&p, opts("k")).unwrap_err().to_string();
+    let err = match Store::open(&p, opts("k")) { Err(e) => e.to_string(), Ok(_) => panic!("key on plaintext db must fail") };
     assert!(err.contains("not encrypted") || err.contains("legacy"), "{err}");
 }
 
@@ -90,7 +90,7 @@ fn import_encrypted_source_refused() {
     }
     let plain_target = dir.join("plain.db");
     let store = Store::open(&plain_target, StoreOpts::default()).unwrap();
-    let err = store.import_legacy(&enc).unwrap_err().to_string();
+    let err = match store.import_legacy(&enc) { Err(e) => e.to_string(), Ok(_) => panic!("encrypted source must be refused") };
     assert!(err.contains("encrypted") || err.contains("SPEC Q9"), "{err}");
 }
 
@@ -111,6 +111,6 @@ fn import_plaintext_source_still_works() {
 #[test]
 fn empty_key_rejected() {
     let dir = temp_dir("emptykey");
-    let err = Store::open(&dir.join("t.db"), opts("")).unwrap_err().to_string();
+    let err = match Store::open(&dir.join("t.db"), opts("")) { Err(e) => e.to_string(), Ok(_) => panic!("empty key must be rejected") };
     assert!(err.contains("empty"), "{err}");
 }
