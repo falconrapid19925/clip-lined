@@ -118,8 +118,7 @@ CREATE TRIGGER IF NOT EXISTS log_fts_au AFTER UPDATE ON log BEGIN
 END;
 ";
 
-const FTS_MATCH_CLAUSE: &str =
-    " AND id IN (SELECT rowid FROM log_fts WHERE log_fts MATCH ?1)";
+const FTS_MATCH_CLAUSE: &str = " AND id IN (SELECT rowid FROM log_fts WHERE log_fts MATCH ?1)";
 const LIKE_CLAUSE: &str =
     " AND (title LIKE '%'||?1||'%' OR appname LIKE '%'||?1||'%' OR url LIKE '%'||?1||'%')";
 
@@ -127,9 +126,11 @@ fn setup_fts(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(FTS_SCHEMA)?;
     // one-time population of pre-existing rows; options flag makes it idempotent
     let built: bool = conn
-        .query_row("SELECT value FROM options WHERE key='fts5_built'", [], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value FROM options WHERE key='fts5_built'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
         .map(|v| v == "1")
         .unwrap_or(false);
     if !built {
@@ -145,18 +146,20 @@ fn setup_fts(conn: &Connection) -> anyhow::Result<()> {
 /// MATCH if q parses as FTS5 syntax, else LIKE (percent wildcards, bare punctuation).
 fn match_clause(conn: &Connection, q: &str) -> anyhow::Result<&'static str> {
     // ponytail: any probe error falls back to LIKE — only failure mode is bad FTS5 syntax
-    Ok(if conn
-        .query_row(
-            "SELECT count(*) FROM log_fts WHERE log_fts MATCH ?1",
-            params![q],
-            |_| Ok(()),
-        )
-        .is_ok()
-    {
-        FTS_MATCH_CLAUSE
-    } else {
-        LIKE_CLAUSE
-    })
+    Ok(
+        if conn
+            .query_row(
+                "SELECT count(*) FROM log_fts WHERE log_fts MATCH ?1",
+                params![q],
+                |_| Ok(()),
+            )
+            .is_ok()
+        {
+            FTS_MATCH_CLAUSE
+        } else {
+            LIKE_CLAUSE
+        },
+    )
 }
 
 const SNIPPETS_SCHEMA: &str = "
@@ -178,7 +181,10 @@ fn apply_key(conn: &Connection, key: &str) -> anyhow::Result<()> {
     // Quote-wrapped string literal (SQLCipher). rusqlite pragma_update helpers
     // mishandle PRAGMA key on reopen, so build the statement by hand with the
     // key SQL-escaped (doubling embedded single quotes).
-    let esc = key.replace(char::from(0x27), char::from(0x27).to_string().repeat(2).as_str());
+    let esc = key.replace(
+        char::from(0x27),
+        char::from(0x27).to_string().repeat(2).as_str(),
+    );
     conn.execute_batch(&format!("PRAGMA key = '{}';", esc))
         .context("PRAGMA key")?;
     conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
@@ -201,7 +207,9 @@ impl Store {
             #[cfg(not(feature = "encryption"))]
             {
                 let _ = key;
-                bail!("StoreOpts.key given but this build lacks the `encryption` feature (rebuild with --features clip-line-core/encryption)");
+                bail!(
+                    "StoreOpts.key given but this build lacks the `encryption` feature (rebuild with --features clip-line-core/encryption)"
+                );
             }
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;

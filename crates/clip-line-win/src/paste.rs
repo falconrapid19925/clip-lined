@@ -8,7 +8,7 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
     VIRTUAL_KEY,
 };
 
@@ -267,8 +267,11 @@ mod tests {
         assert_eq!(inputs.len(), units.len() * 2);
         for (i, inp) in inputs.iter().enumerate() {
             let up = i % 2 == 1;
-            assert!(unsafe { inp.Anonymous.ki.dwFlags.0 }
-                & windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_UNICODE.0 != 0);
+            assert!(
+                unsafe { inp.Anonymous.ki.dwFlags.0 }
+                    & windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_UNICODE.0
+                    != 0
+            );
             let keyup = windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP.0;
             assert_eq!(unsafe { inp.Anonymous.ki.dwFlags.0 } & keyup != 0, up);
         }

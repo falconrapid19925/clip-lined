@@ -385,9 +385,23 @@ fn fts_odd_query_no_panic() {
     let (store, _p) = temp_store("fts-odd");
     store.append(&text_event("some clip")).unwrap();
     for q in [
-        "", " ", "%", "_", "(", "\"", "*", "OR", "NEAR(", "\\", "a b -", "ünïcödé",
+        "",
+        " ",
+        "%",
+        "_",
+        "(",
+        "\"",
+        "*",
+        "OR",
+        "NEAR(",
+        "\\",
+        "a b -",
+        "ünïcödé",
     ] {
         // must not panic; any result count acceptable
-        let _ = store.list(&Filter { query: Some(q.into()), ..Default::default() });
+        let _ = store.list(&Filter {
+            query: Some(q.into()),
+            ..Default::default()
+        });
     }
 }

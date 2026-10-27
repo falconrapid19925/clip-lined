@@ -7,9 +7,7 @@ use clip_line_core::capture::{Block, Format};
 use clip_line_core::paste::ClipData;
 use clip_line_win::WinPaster;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL};
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, OpenClipboard,
-};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
 fn read_clipboard_unicode() -> Option<Vec<u16>> {
@@ -65,5 +63,9 @@ fn set_only_text_round_trip() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(read.as_deref(), Some(units.as_slice()), "clipboard text mismatch");
+    assert_eq!(
+        read.as_deref(),
+        Some(units.as_slice()),
+        "clipboard text mismatch"
+    );
 }

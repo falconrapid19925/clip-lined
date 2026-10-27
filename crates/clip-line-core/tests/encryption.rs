@@ -10,7 +10,10 @@ fn text_event(s: &str) -> ClipEvent {
     let mut bytes: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     bytes.extend_from_slice(&[0, 0]);
     ClipEvent {
-        blocks: vec![Block { format: Format::UnicodeText, bytes }],
+        blocks: vec![Block {
+            format: Format::UnicodeText,
+            bytes,
+        }],
         source_app: "demo".into(),
         source_title: String::new(),
     }
@@ -24,7 +27,9 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn opts(key: &str) -> StoreOpts {
-    StoreOpts { key: Some(key.into()) }
+    StoreOpts {
+        key: Some(key.into()),
+    }
 }
 
 #[test]
@@ -38,16 +43,26 @@ fn key_roundtrip_append_load() {
 
     // file is not plaintext sqlite
     let head = std::fs::read(&p).unwrap();
-    assert!(!head.starts_with(b"SQLite format 3"), "db must be encrypted");
+    assert!(
+        !head.starts_with(b"SQLite format 3"),
+        "db must be encrypted"
+    );
     // plaintext reader cannot open it
-    assert!(rusqlite::Connection::open(&p).unwrap()
-        .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(())).is_err());
+    assert!(
+        rusqlite::Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+            .is_err()
+    );
 
     let store2 = Store::open(&p, opts("sekrit")).unwrap();
     let blocks = store2.load_data(id as i64).unwrap();
     assert_eq!(blocks.len(), 1);
-    let units: Vec<u16> = blocks[0].bytes.chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = blocks[0]
+        .bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let s = String::from_utf16(&units).unwrap();
     assert_eq!(s.trim_end_matches('\0'), "encrypted hello");
     assert_eq!(store2.list(&Filter::default()).unwrap().len(), 1);
@@ -61,10 +76,19 @@ fn wrong_key_fails_clearly() {
         let store = Store::open(&p, opts("right")).unwrap();
         store.append(&text_event("data")).unwrap();
     }
-    let err = match Store::open(&p, opts("wrong")) { Err(e) => e.to_string(), Ok(_) => panic!("wrong key must fail") };
-    assert!(err.contains("wrong key"), "message should name the cause: {err}");
+    let err = match Store::open(&p, opts("wrong")) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("wrong key must fail"),
+    };
+    assert!(
+        err.contains("wrong key"),
+        "message should name the cause: {err}"
+    );
     // no key on an encrypted db also fails with the clear message
-    let err = match Store::open(&p, StoreOpts::default()) { Err(e) => e.to_string(), Ok(_) => panic!("no-key open of encrypted db must fail") };
+    let err = match Store::open(&p, StoreOpts::default()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("no-key open of encrypted db must fail"),
+    };
     assert!(err.contains("key") || err.contains("database"), "{err}");
 }
 
@@ -76,8 +100,14 @@ fn legacy_plaintext_with_key_fails_clearly() {
         let store = Store::open(&p, StoreOpts::default()).unwrap(); // plaintext
         store.append(&text_event("legacy row")).unwrap();
     }
-    let err = match Store::open(&p, opts("k")) { Err(e) => e.to_string(), Ok(_) => panic!("key on plaintext db must fail") };
-    assert!(err.contains("not encrypted") || err.contains("legacy"), "{err}");
+    let err = match Store::open(&p, opts("k")) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("key on plaintext db must fail"),
+    };
+    assert!(
+        err.contains("not encrypted") || err.contains("legacy"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -90,8 +120,14 @@ fn import_encrypted_source_refused() {
     }
     let plain_target = dir.join("plain.db");
     let store = Store::open(&plain_target, StoreOpts::default()).unwrap();
-    let err = match store.import_legacy(&enc) { Err(e) => e.to_string(), Ok(_) => panic!("encrypted source must be refused") };
-    assert!(err.contains("encrypted") || err.contains("SPEC Q9"), "{err}");
+    let err = match store.import_legacy(&enc) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("encrypted source must be refused"),
+    };
+    assert!(
+        err.contains("encrypted") || err.contains("SPEC Q9"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -111,6 +147,9 @@ fn import_plaintext_source_still_works() {
 #[test]
 fn empty_key_rejected() {
     let dir = temp_dir("emptykey");
-    let err = match Store::open(&dir.join("t.db"), opts("")) { Err(e) => e.to_string(), Ok(_) => panic!("empty key must be rejected") };
+    let err = match Store::open(&dir.join("t.db"), opts("")) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("empty key must be rejected"),
+    };
     assert!(err.contains("empty"), "{err}");
 }
