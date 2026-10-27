@@ -1,7 +1,6 @@
 # clipLine
 
-[![CI](https://github.com/clip-line/clip-line/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/clip-line.svg)](https://crates.io/crates/clip-line)
+[![CI](https://github.com/katsugtgz/clip-line/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 
 A fast, open-source clipboard history manager for Windows, Linux and macOS,
@@ -24,7 +23,7 @@ written in Rust.
 
 Phase status: capture (Windows), storage, search, list UI live. Paste
 injection, snippets tab, tray, hotkey popup, Linux/macOS adapters on the
-[roadmap](https://github.com/clip-line/clip-line/milestones).
+[roadmap](https://github.com/katsugtgz/clip-line/milestones).
 
 ## Prerequisites
 
@@ -39,7 +38,7 @@ injection, snippets tab, tray, hotkey popup, Linux/macOS adapters on the
 From source:
 
 ```sh
-git clone https://github.com/clip-line/clip-line.git
+git clone https://github.com/katsugtgz/clip-line.git
 cd clip-line
 cargo install --path crates/clip-line-app
 ```

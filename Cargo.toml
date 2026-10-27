@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/clip-line/clip-line"
-homepage = "https://clip-line.github.io"
+repository = "https://github.com/katsugtgz/clip-line"
+homepage = "https://katsugtgz.github.io/clip-line"
 
 [workspace.dependencies]
 anyhow = "1"
