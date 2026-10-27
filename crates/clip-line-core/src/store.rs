@@ -109,13 +109,49 @@ CREATE TABLE IF NOT EXISTS snippets.common(
   description TEXT not null default '');
 ";
 
+/// Runs `PRAGMA key` before any schema op and verifies it immediately, so a
+/// wrong key or a legacy unencrypted database fails with one clear message
+/// (both surface as SQLITE_NOTADB). SPEC Q9.
+#[cfg(feature = "encryption")]
+fn apply_key(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        bail!("StoreOpts.key must not be empty");
+    }
+    conn.pragma_update(None, "key", key).context("PRAGMA key")?;
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot open database with key: wrong key, or the database is not \
+                 encrypted. Legacy databases are unlocked: open them without a key. \
+                 Encrypted databases are new DBs only (SPEC Q9): {e}"
+            )
+        })?;
+    Ok(())
+}
+
 impl Store {
     /// Opens an existing database in place; creates schema when absent.
-    pub fn open(path: &Path, _opts: StoreOpts) -> anyhow::Result<Store> {
-        // ponytail: opts.key ignored until the `encryption` cargo feature lands (SQLCipher).
+    /// `StoreOpts.key` creates/opens an SQLCipher-encrypted database; encrypted
+    /// databases are new DBs only (SPEC Q9). Legacy unencrypted files must be
+    /// opened without a key.
+    pub fn open(path: &Path, opts: StoreOpts) -> anyhow::Result<Store> {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        if let Some(key) = opts.key.as_deref() {
+            #[cfg(feature = "encryption")]
+            apply_key(&conn, key)?;
+            #[cfg(not(feature = "encryption"))]
+            {
+                let _ = key;
+                bail!("StoreOpts.key given but this build lacks the `encryption` feature (rebuild with --features clip-line-core/encryption)");
+            }
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(SCHEMA).with_context(|| {
+            format!(
+                "schema access failed on {}: wrong or missing key, or not a database",
+                path.display()
+            )
+        })?;
         Ok(Store {
             conn: Mutex::new(conn),
             snips_attached: AtomicBool::new(false),
@@ -329,12 +365,33 @@ impl Store {
     }
 
     /// Copies every row from a legacy database into this one, preserving ids.
+    /// Refuses encrypted/corrupt sources with an explanatory error (SPEC Q9).
     pub fn import_legacy(&self, legacy: &Path) -> anyhow::Result<u64> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(&format!(
+        // KEY '' keeps the source plaintext: SQLCipher would otherwise encrypt
+        // the attached file with the main database key.
+        #[cfg(feature = "encryption")]
+        let attach = format!(
+            "ATTACH DATABASE '{}' AS src KEY '';",
+            legacy.display().to_string().replace('\'', "''")
+        );
+        #[cfg(not(feature = "encryption"))]
+        let attach = format!(
             "ATTACH DATABASE '{}' AS src;",
             legacy.display().to_string().replace('\'', "''")
-        ))?;
+        );
+        conn.execute_batch(&attach)
+            .with_context(|| format!("attach {}", legacy.display()))?;
+        if let Err(e) = conn.query_row("SELECT count(*) FROM src.sqlite_schema", [], |_| Ok(())) {
+            let _ = conn.execute_batch("DETACH DATABASE src;");
+            bail!(
+                "cannot import {}: {}. The source is encrypted (or not a SQLite \
+                 database); clipLine cannot read encrypted sources (SPEC Q9). \
+                 Import from the unencrypted original",
+                legacy.display(),
+                e
+            );
+        }
         let before: i64 = conn.query_row("SELECT count(*) FROM log", [], |r| r.get(0))?;
         conn.execute_batch(
             "INSERT OR IGNORE INTO log SELECT * FROM src.log;
