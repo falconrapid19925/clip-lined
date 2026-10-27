@@ -2,8 +2,8 @@
 
 use clip_line_core::capture::{Block, Capture, ClipEvent, Format};
 use std::io::Read;
-use wl_clipboard_rs::paste::{self, Error as WlError, MimeType};
-use wl_clipboard_rs::watch::{self, ClipboardEvent, ClipboardType, Offer, Watcher};
+use wl_clipboard_rs::paste::Error as WlError;
+use wl_clipboard_rs::watch::{ClipboardEvent, ClipboardType, Offer, Watcher};
 
 /// Best MIME per offer. Ranked: utf8 text, png image, uri-list, plain text.
 /// Everything else (aliases, html, obscure types) dropped — v1 archives one

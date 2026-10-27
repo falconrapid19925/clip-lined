@@ -9,13 +9,12 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, MSG, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindowTextW,
+    GetWindowThreadProcessId, MSG, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLIPBOARDUPDATE,
 };
 use windows::core::PCWSTR;
 
@@ -125,7 +124,18 @@ unsafe fn read_clipboard() -> anyhow::Result<ClipEvent> {
     unsafe {
         let (app, title) = foreground_app();
         let mut blocks = Vec::new();
-        if OpenClipboard(None).is_err() {
+        // Cross-process contention: another app may hold the clipboard for a
+        // few ms. Bounded retry (SPEC capture: adapters own retries); only a
+        // persistent failure falls back to the empty (skip) event.
+        let mut opened = false;
+        for _ in 0..10 {
+            if OpenClipboard(None).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !opened {
             return Ok(ClipEvent {
                 blocks,
                 source_app: app,
@@ -224,7 +234,12 @@ unsafe fn foreground_process_name() -> Option<String> {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
-        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
+        let r = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
         let _ = windows::Win32::Foundation::CloseHandle(h);
         if r.is_err() {
             return None;
@@ -258,7 +273,13 @@ mod tests {
     fn suppression_matches_only_the_recorded_sequence() {
         assert!(should_ignore(Some(42), 42), "self-originated event ignored");
         assert!(!should_ignore(Some(42), 43), "next foreign event passes");
-        assert!(!should_ignore(None, 42), "no suppression armed: everything passes");
-        assert!(!should_ignore(Some(0), 1), "seq 0 (no clipboard yet) never blocks later events");
+        assert!(
+            !should_ignore(None, 42),
+            "no suppression armed: everything passes"
+        );
+        assert!(
+            !should_ignore(Some(0), 1),
+            "seq 0 (no clipboard yet) never blocks later events"
+        );
     }
 }
