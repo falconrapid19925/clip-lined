@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Linux GUI libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libxrandr-dev
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-${{ matrix.os }}-
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Headless demo
+        run: cargo run -p clip-line-app --bin clip-line-headless
+
+  build-release:
+    name: Release build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: clip-line-windows-x64
+          - os: ubuntu-latest
+            artifact: clip-line-linux-x64
+          - os: macos-latest
+            artifact: clip-line-macos-universal
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-rel-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml') }}
+      - name: Build release
+        run: cargo build --release -p clip-line-app
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/clip-line-app*
+            target/release/clip-line-headless*
+
+  pages:
+    name: GitHub Pages
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/configure-pages@v6.0.0
+      - uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: docs/site
+      - id: deploy
+        uses: actions/deploy-pages@v5.0.1

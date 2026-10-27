@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/clip-line-core", "crates/clip-line-win", "crates/clip-line-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/clip-line/clip-line"
+homepage = "https://clip-line.github.io"
+
+[workspace.dependencies]
+anyhow = "1"
+flate2 = "1"
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+strip = true

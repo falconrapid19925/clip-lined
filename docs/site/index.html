@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clipLine — open-source clipboard history</title>
+<meta name="description" content="Fast, open-source clipboard history manager for Windows, Linux and macOS. Rust + SQLite.">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  .hero { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: center; }
+  .hero h1 { font-size: 2.4rem; margin: 0 0 .25rem; }
+  .hero p { margin: .25rem 0 0; font-size: 1.1rem; opacity: .85; }
+  .logo { width: 84px; height: 84px; flex: none; }
+  .cta { display: flex; gap: .75rem; flex-wrap: wrap; margin: 1.5rem 0; }
+  .cta a { text-decoration: none; padding: .6rem 1.1rem; border-radius: 10px; font-weight: 600; }
+  .cta .primary { background: #2563eb; color: #fff; }
+  .cta .ghost { border: 1px solid currentColor; }
+  img.shot { width: 100%; border-radius: 12px; border: 1px solid rgba(127,127,127,.35); margin: 1rem 0 2rem; }
+  h2 { margin-top: 2.5rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+  .card { border: 1px solid rgba(127,127,127,.35); border-radius: 12px; padding: 1rem 1.1rem; }
+  .card h3 { margin: 0 0 .4rem; font-size: 1.05rem; }
+  .card p { margin: 0; font-size: .95rem; opacity: .85; }
+  code, pre { font: .9rem/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
+  pre { background: rgba(127,127,127,.12); padding: 1rem; border-radius: 10px; overflow: auto; }
+  footer { margin-top: 4rem; opacity: .7; font-size: .9rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <svg class="logo" viewBox="0 0 64 64" aria-label="clipLine logo">
+      <rect x="18" y="6" width="28" height="10" rx="3" fill="#2563eb"/>
+      <rect x="8" y="12" width="48" height="46" rx="6" fill="none" stroke="#2563eb" stroke-width="5"/>
+      <path d="M20 30h24M20 40h24M20 50h14" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <h1>clipLine</h1>
+      <p>Fast, open-source clipboard history for Windows, Linux and macOS. Rust + SQLite, local first.</p>
+    </div>
+  </div>
+  <div class="cta">
+    <a class="primary" href="https://github.com/clip-line/clip-line/releases">Download</a>
+    <a class="ghost" href="https://github.com/clip-line/clip-line">Source code</a>
+  </div>
+
+  <img class="shot" src="assets/screenshot.png" alt="clipLine main window showing clipboard history with types, timestamps and source apps">
+
+  <div class="grid">
+    <div class="card"><h3>Everything, captured</h3><p>Text, URLs, images and copied files land in one searchable history, tagged with the app that made them.</p></div>
+    <div class="card"><h3>Paste anywhere</h3><p>Put a clip back on the clipboard or inject Ctrl+V straight into the window you came from.</p></div>
+    <div class="card"><h3>Own your data</h3><p>One SQLite file in your config dir. No account, no cloud, no telemetry.</p></div>
+    <div class="card"><h3>Plays well</h3><p>Reads and extends an existing ClipDiary history database in place — format documented for anyone to adopt.</p></div>
+  </div>
+
+  <h2>Install</h2>
+  <pre>git clone https://github.com/clip-line/clip-line.git
+cd clip-line
+cargo install --path crates/clip-line-app</pre>
+  <p>Or grab a prebuilt binary from the <a href="https://github.com/clip-line/clip-line/releases">releases page</a>.</p>
+
+  <h2>Try it without a GUI</h2>
+  <pre>cargo run -p clip-line-app --bin clip-line-headless</pre>
+
+  <h2>Why clipLine</h2>
+  <p>The original ClipDiary is Windows-only and closed source. clipLine is a
+  clean-room, MIT-licensed rebuild of the same interaction model — history
+  list, search, stars, tags, snippets — that runs on every desktop OS. See
+  <a href="https://github.com/clip-line/clip-line/blob/main/docs/interop.md">docs/interop.md</a>
+  for the database format we keep compatible.</p>
+
+  <footer>MIT licensed. Not affiliated with Softvoile ClipDiary. Screenshot shows an early build; UI evolves.</footer>
+</div>
+</body>
+</html>

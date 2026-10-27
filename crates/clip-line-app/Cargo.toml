@@ -1,0 +1,29 @@
+[package]
+name = "clip-line-app"
+description = "clipLine desktop application (egui)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "clip-line-app"
+
+[[bin]]
+name = "clip-line-app"
+path = "src/main.rs"
+
+[[bin]]
+name = "clip-line-headless"
+path = "src/bin/headless.rs"
+
+[dependencies]
+clip-line-core = { path = "../clip-line-core" }
+anyhow.workspace = true
+eframe = "0.37"
+egui_extras = { version = "0.37", features = ["serde"] }
+
+[target.'cfg(windows)'.dependencies]
+clip-line-win = { path = "../clip-line-win" }
+
+[dev-dependencies]
+tempfile = "3"
