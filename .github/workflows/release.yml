@@ -43,7 +43,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           mkdir pkg && cp target/release/clip-line-app.exe target/release/clip-line-headless.exe pkg/
-          Compress-Archive -Path pkg/* -DestinationPath "${{ matrix.asset }}"
+          Compress-Archive -Path pkg -DestinationPath "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.asset }}
