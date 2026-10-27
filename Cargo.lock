@@ -688,6 +688,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clip-line-wayland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clip-line-core",
+ "wl-clipboard-rs",
+]
+
+[[package]]
 name = "clip-line-win"
 version = "0.1.0"
 dependencies = [
