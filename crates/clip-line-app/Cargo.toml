@@ -24,6 +24,8 @@ egui_extras = { version = "0.37", features = ["serde"] }
 serde.workspace = true
 toml.workspace = true
 global-hotkey = "0.9"
+# Q11 update check: plain blocking HTTP GET, no async runtime needed
+ureq = "2"
 
 [target.'cfg(windows)'.dependencies]
 clip-line-win = { path = "../clip-line-win" }
